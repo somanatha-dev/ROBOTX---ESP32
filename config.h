@@ -717,44 +717,40 @@ static_assert(US_MIN_GOOD_SAMPLES <= US_SAMPLE_WINDOW,
 
 // Failsafe. If no ACCEPTED movement command arrives within this window the
 // motors are zeroed and state becomes COMMAND_TIMEOUT.
-// Only an accepted DRIVE / MOVE / STOP refreshes this. Malformed lines,
-// unknown commands, rejected commands, RESET and PING do NOT.
+// Only a fully validated DRIVE / MOVE / STOP refreshes this (accepted, or
+// accepted-but-gated). Invalid frames, bad CRCs, rejected commands, duplicate
+// sequence numbers, unknown commands, RESET, PING, MOTORTEST and diagnostics
+// do NOT.
 #define COMMAND_TIMEOUT_MS      2000UL
 
-#define TELEMETRY_INTERVAL_MS   200UL
 #define SERIAL_BAUD             115200
+
+// Longest received line, in bytes, before its LF terminator (an optional CR
+// included). The longest legal v2 command in compact form (MOTORTEST) is 102
+// bytes; a longer line is discarded whole and answered with ERROR
+// FRAME_TOO_LONG.
 #define COMM_LINE_MAX           160
 
-// Telemetry is assembled into one buffer and written in a single call, rather
-// than through ~40 separate Serial.print() calls. Must be large enough for
-// the longest possible line; overflow is detected and reported as
-// {"event":"TELEMETRY_OVERFLOW"}, never silently truncated into invalid JSON.
-//
-// MEASURED worst case, counting every field at its maximum width with the
-// debug and legacy blocks both compiled in:
-//
-//     main block           1410 bytes
-//     legacy rear_ir block  357 bytes   (TELEMETRY_INCLUDE_LEGACY_REAR)
-//     debug block           308 bytes   (TELEMETRY_INCLUDE_DEBUG)
-//     ------------------------------
-//     worst case           ~2100 bytes + NUL
-//
-// The longest single field is "last_reject", whose longest value is the
-// 41-character NEEDS_ONBLOCKS_TRUE_ROVER_MUST_BE_SECURED.
-//
-// 2560 leaves ~450 bytes of headroom. Do NOT shrink this -- overflow is only
-// detectable at runtime and it costs you the entire telemetry line.
-// (The previous 1536 was sized for the 1181-byte pre-rear-ToF line.)
-#define TELEMETRY_BUF_SIZE      2560
+// Every outgoing frame (ACK, ERROR, EVENT, TELEMETRY, DIAG) is built in ONE
+// buffer of this size and written with a single call. A frame that does not
+// fit is never truncated: an ERROR TX_FRAME_OVERFLOW frame goes out instead.
+// The largest frames are diagnostic ACKs (HWREPORT, I2CSCAN); the measured
+// sizes are in PROTOCOL.md.
+#define COMM_TX_FRAME_MAX       2560
 
-// Enlarged UART TX buffer so a full telemetry line is handed to the UART
-// driver and drained by its ISR, instead of blocking the control loop while it
-// clocks out at 115200 baud.
+// At most this many ERROR frames per second answer UNIDENTIFIABLE input
+// (seq null: bad frame, bad CRC, malformed content). Line noise on RX must not
+// be able to fill the TX link with error reports. Suppressed errors are
+// counted in DIAG SYSTEM "link.errors_suppressed".
+#define COMM_ERROR_FRAMES_PER_SEC 10
+
+// Enlarged UART TX buffer so a whole frame is handed to the UART driver and
+// drained by its ISR, instead of blocking the control loop while it clocks
+// out at 115200 baud.
 //
-// THIS MUST BE LARGER THAN TELEMETRY_BUF_SIZE. If a line does not fit, the
-// write blocks until the ISR has drained enough room -- up to ~180 ms with the
-// control loop, and therefore the safety gate, stopped dead. The previous 2048
-// was sized for the old 1181-byte line and is no longer enough.
+// THIS MUST BE LARGER THAN COMM_TX_FRAME_MAX. If a frame does not fit, the
+// write blocks until the ISR has drained enough room, with the control loop,
+// and therefore the safety gate, stopped.
 #define SERIAL_TX_BUFFER_BYTES  3072
 
 // Enlarged UART RX ring buffer.
@@ -773,54 +769,30 @@ static_assert(US_MIN_GOOD_SAMPLES <= US_SAMPLE_WINDOW,
 // to spare. Must precede Serial.begin().
 #define SERIAL_RX_BUFFER_BYTES  1024
 
-static_assert(SERIAL_TX_BUFFER_BYTES > TELEMETRY_BUF_SIZE,
-              "SERIAL_TX_BUFFER_BYTES must exceed TELEMETRY_BUF_SIZE, or a "
-              "full telemetry line blocks the control loop while it drains.");
+static_assert(SERIAL_TX_BUFFER_BYTES > COMM_TX_FRAME_MAX,
+              "SERIAL_TX_BUFFER_BYTES must exceed COMM_TX_FRAME_MAX, or a "
+              "large frame blocks the control loop while it drains.");
 
-// LINK BUDGET, and how to halve it.
-// -----------------------------------
-//   *** READ THIS BEFORE THE FIRST BENCH RUN. ***
+// TELEMETRY (protocol v2)
+// -----------------------
+// Telemetry is split in two, so the stream the Pi drives from stays small:
 //
-// The rear ToF block roughly doubled the telemetry line, and the link budget
-// is now genuinely tight. At 115200 baud (10 bits per byte with start/stop),
-// against a TELEMETRY_INTERVAL_MS of 200 ms:
+//   TELEMETRY  every TELEMETRY_INTERVAL_MS -- state, commanded vs applied
+//              motion, distances, gates, failsafe.
+//   DIAG       one section every TELEMETRY_DIAG_EVERY_N_FAST fast frames,
+//              sent half an interval after the fast frame, rotating
+//              FRONT -> REAR -> SYSTEM. Health, per-sensor detail, bus and
+//              configuration status, link statistics, calibration aids.
 //
-//   debug ON,  legacy ON   ~2075 B  ->  180 ms  ->  90 % utilisation
-//   debug OFF, legacy ON   ~1767 B  ->  154 ms  ->  77 %
-//   debug ON,  legacy OFF  ~1718 B  ->  149 ms  ->  75 %
-//   debug OFF, legacy OFF  ~1410 B  ->  123 ms  ->  61 %
-//
-// Those are WORST cases -- a typical line, with real distances and short
-// status strings, is a few hundred bytes shorter. But at 90 % worst case
-// there is very little room left for command acks, and a burst of acks during
-// commissioning WILL queue behind a telemetry line.
-//
-// THE DEFAULTS BELOW ARE DELIBERATELY LEFT AS THEY WERE. Both blocks stay on,
-// and TELEMETRY_INTERVAL_MS stays at 200 ms, because dropping a published
-// field or changing the telemetry cadence would be a change to the contract
-// the Pi already relies on -- not something to do silently as a side effect of
-// adding rear sensing. Choose one of these deliberately once you have seen the
-// real traffic:
-//
-//   * set TELEMETRY_INCLUDE_DEBUG to 0        (once sensors are commissioned)
-//   * set TELEMETRY_INCLUDE_LEGACY_REAR to 0  (once the Pi reads rear_sensor_*)
-//   * raise TELEMETRY_INTERVAL_MS to 250-300
-//
-// Do NOT raise the baud rate: it is part of the Pi contract.
-//
-// TELEMETRY_INCLUDE_DEBUG drops the calibration block -- raw samples,
-// good-sample counts, timeout streaks, rear raw readings and fail streaks.
-// All safety-relevant fields are kept either way.
-//
-// If you need more headroom than that, raise TELEMETRY_INTERVAL_MS rather
-// than raising the baud rate -- the baud rate is part of the Pi contract.
+// Measured sizes and the resulting link load are in PROTOCOL.md
+// ("Bandwidth"). Do NOT raise the baud rate: it is part of the Pi contract.
+#define TELEMETRY_INTERVAL_MS        200UL
+#define TELEMETRY_DIAG_EVERY_N_FAST  2
+
+// TELEMETRY_INCLUDE_DEBUG adds the calibration fields to the DIAG FRONT and
+// REAR sections -- raw samples, good-sample counts, timeout streaks, rear raw
+// readings and fail streaks. All safety-relevant fields are sent either way.
 #define TELEMETRY_INCLUDE_DEBUG 1
-
-// The legacy rear_ir_* fields, kept so an existing Pi-side parser sees no
-// change. They are aliases of the new rear_sensor_* fields, derived from the
-// same latched state. Set to 0 once the Pi reads rear_sensor_0_mm and friends
-// -- that is ~357 bytes off every line.
-#define TELEMETRY_INCLUDE_LEGACY_REAR 1
 
 // Bounded duration for the MOTORTEST commissioning command.
 #define MOTORTEST_DEFAULT_MS    600UL

@@ -148,24 +148,11 @@ void setup()
     // commanded". Nothing moves until a valid movement command arrives.
     commUpdateRuntime(0, 0, "NONE");
 
-    // The READY line reports what actually came up, not what was hoped for.
+    // The READY event reports what actually came up, not what was hoped for.
     // If the Pi sees motor_drive_available:false here, the rover will not move
     // and no command will change that until the PCA9685 address is confirmed.
-    Serial.printf("{\"event\":\"READY\",\"fw\":\"rover-esp32\","
-                  "\"core\":\"2.0.14\",\"drive\":\"DIFFERENTIAL\","
-                  "\"i2c_ready\":%s,\"tca_status\":\"%s\","
-                  "\"pca_status\":\"%s\",\"motor_drive_available\":%s,"
-                  "\"rear_backend\":\"%s\",\"rear_available\":%s,"
-                  "\"rear_sensor_status\":[\"%s\",\"%s\",\"%s\"]}\n",
-                  roverI2cReady() ? "true" : "false",
-                  tcaStatusName(),
-                  pca9685StatusName(),
-                  motorDriveAvailable() ? "true" : "false",
-                  rearBackendName(),
-                  safetyRearSensingAvailable() ? "true" : "false",
-                  rearTofStatusName(rearTofStatusOf(REAR_TOF_0)),
-                  rearTofStatusName(rearTofStatusOf(REAR_TOF_1)),
-                  rearTofStatusName(rearTofStatusOf(REAR_TOF_2)));
+    // The boot ROM's plain-text output may precede it on the same UART.
+    commEmitReady();
 
     // ------------------------------------------------------------------
     // 5. ONE-SHOT I2C BUS SCAN.
@@ -189,8 +176,6 @@ void setup()
 
 void loop()
 {
-    static uint32_t lastTelemetryMs = 0;
-
     // ------------------------------------------------------------------
     // 1. COMMANDS (pre-sensor)
     //    Drain the UART before the sensor tick, which can block for up to
@@ -227,10 +212,7 @@ void loop()
     if (commTestModeActive()) {
         motorDriveChannel(commTestChannel(), commTestSpeed());
 
-        if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
-            sendTelemetry();
-            lastTelemetryMs = millis();
-        }
+        commServiceTelemetry();
         delay(1);
         return;
     }
@@ -309,12 +291,9 @@ void loop()
     commUpdateRuntime(appLeft, appRight, blockReason);
 
     // ------------------------------------------------------------------
-    // 7. TELEMETRY
+    // 7. TELEMETRY  (fast TELEMETRY frame + rotating DIAG sections)
     // ------------------------------------------------------------------
-    if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
-        sendTelemetry();
-        lastTelemetryMs = millis();
-    }
+    commServiceTelemetry();
 
     // ------------------------------------------------------------------
     // 8. YIELD
