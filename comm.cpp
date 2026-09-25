@@ -1705,6 +1705,15 @@ static void txDiagRear(void)
     txStr("rear_backend", rearBackendName());
     txBool("rear_orientation_verified", rearTofOrientationVerified());
 
+    // Physical position per index, in the same order as every rear array.
+    // null until a human has verified the orientation.
+    if (rearTofOrientationVerified()) {
+        tx(",\"rear_positions\":[\"%s\",\"%s\",\"%s\"]",
+           REAR_TOF_0_POSITION, REAR_TOF_1_POSITION, REAR_TOF_2_POSITION);
+    } else {
+        tx(",\"rear_positions\":null");
+    }
+
     tx(",\"rear_sensor_valid\":[");
     for (uint8_t i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
         tx("%s%s", i ? "," : "", safetyRearSensorValid(i) ? "true" : "false");

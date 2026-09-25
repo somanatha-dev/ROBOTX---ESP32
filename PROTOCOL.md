@@ -266,7 +266,7 @@ Every EVENT carries `seq` (null except `MOTORTEST_DONE`) and `uptime_ms`.
 | Section | Keys |
 |---|---|
 | `FRONT` | `front_left_valid`, `front_right_valid`, `front_left_health`, `front_right_health`, `front_health`, `front_closest_cm`, `sensor_map_verified`; debug: `front_*_raw_cm`, `front_*_samples`, `front_*_timeout_streak` |
-| `REAR` | `rear_backend`, `rear_orientation_verified`, arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`; debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
+| `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`; debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
 | `SYSTEM` | `proto`, `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
 
 Debug keys are controlled by `TELEMETRY_INCLUDE_DEBUG` in `config.h`.

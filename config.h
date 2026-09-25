@@ -156,8 +156,8 @@
 //
 // CAUTION: a PCA9685 with all six address jumpers bridged also lands in
 // 0x70..0x77, so a bare scan can be ambiguous. Step 2 is what disambiguates.
-#define TCA9548A_I2C_ADDRESS        0x70
-#define TCA9548A_ADDRESS_CONFIRMED  0       // <-- SET TO 1 ONLY AFTER TCATEST
+#define TCA9548A_I2C_ADDRESS        0x71
+#define TCA9548A_ADDRESS_CONFIRMED  1       // <-- SET TO 1 ONLY AFTER TCATEST
 
 // Channel assignment. CONFIRMED by the operator.
 // These are ELECTRICAL channel indices. They say nothing about which sensor is
@@ -423,8 +423,8 @@
 //   * The TCA9548A's I2C address -- see the I2C DEVICES section above. While
 //     TCA9548A_ADDRESS_CONFIRMED is 0, NO rear sensor is ever accessed and
 //     every reading reports TOF_UNINITIALISED. Nothing is fabricated.
-//   * Which sensor is physically LEFT, CENTRE or RIGHT at the rear. Indices
-//     0/1/2 are TCA channel numbers and nothing more.
+//   (Physical LEFT/CENTRE/RIGHT is now VERIFIED -- see REAR_TOF_n_POSITION
+//   below. Indices 0/1/2 are still TCA channel order.)
 //   * The correct obstacle thresholds for this rover's reverse stopping
 //     distance -- the values below are COMMISSIONING VALUES.
 // ============================================================================
@@ -437,11 +437,19 @@
 #define REAR_TOF_1                  1
 #define REAR_TOF_2                  2
 
-// Is the physical left/centre/right arrangement confirmed? NO.
+// Is the physical left/centre/right arrangement confirmed? YES (2026-09-25:
+// one hand test per sensor, listen-only DIAG REAR captures).
 // This is a LABELLING flag only. Like the front sensors, any one of the three
 // asserting an obstacle blocks reverse, so a wrong orientation map mislabels
 // telemetry but cannot open a safety hole.
-#define REAR_TOF_ORIENTATION_VERIFIED 0
+#define REAR_TOF_ORIENTATION_VERIFIED 1
+
+// Physical position of each sensor INDEX, looking at the rear of the rover.
+// Index n sits on TCA channel TCA_CH_REAR_TOF_n. LABELS ONLY: nothing in
+// init, polling or the safety gate reads these.
+#define REAR_TOF_0_POSITION         "CENTRE"    // TCA ch 0
+#define REAR_TOF_1_POSITION         "LEFT"      // TCA ch 1
+#define REAR_TOF_2_POSITION         "RIGHT"     // TCA ch 2
 
 // Derived: can the firmware actually reach the rear sensors? This is purely a
 // question of whether the multiplexer address has been confirmed by a human.

@@ -687,7 +687,25 @@ def t24_diagnostics(ctx):
     check(isinstance(f.get("devices"), list) and "count" in f, f"{f}")
     ack(ctx.cmd("I2CSTATUS"), result="ACCEPTED")
     ack(ctx.cmd("HWREPORT"), result="ACCEPTED")
-    ack(ctx.cmd("TCATEST"), result="REJECTED", reason="NO_ADDR_GIVEN_AND_NONE_CONFIRMED")
+    # PCATEST with no address: the expected answer depends on whether the
+    # PCA9685 address is confirmed, so ask the ESP32 rather than assume.
+    pca_confirmed = ctx.diag("SYSTEM").get("pca_address_confirmed")
+    check(isinstance(pca_confirmed, bool), f"pca_address_confirmed not a bool: {pca_confirmed!r}")
+    if not pca_confirmed:
+        ack(ctx.cmd("PCATEST"), result="REJECTED", reason="NO_ADDR_GIVEN_AND_NONE_CONFIRMED")
+    else:
+        f = ack(ctx.cmd("PCATEST"), result="ACCEPTED", reason="NONE")
+        check(f.get("addr") == 0x40 and f.get("addr_hex") == "0x40",
+              f"configured PCA9685 address is not 0x40: {f}")
+        check(f.get("responded") is True and f.get("i2c_error") == "OK"
+              and f.get("status") == "OK", f"PCATEST at configured address failed: {f}")
+        for key in ("mode1", "prescale"):
+            v = f.get(key)
+            check(isinstance(v, str) and len(v) == 4 and v.startswith("0x")
+                  and all(c in "0123456789ABCDEF" for c in v[2:]), f"{key} malformed: {f}")
+        check(isinstance(f.get("implied_freq_hz"), int)
+              and isinstance(f.get("configured_freq_hz"), int), f"freq fields malformed: {f}")
+        check("action" not in f, f"confirmed address still asks for a config action: {f}")
     ack(ctx.cmd("TCATEST", addr=200), result="REJECTED", reason="OUT_OF_RANGE", field="addr")
     ack(ctx.cmd("TCATEST", addr="0x70"), result="REJECTED", reason="WRONG_TYPE", field="addr")
     ack(ctx.cmd("TOFTEST", sensor=3), result="REJECTED", reason="OUT_OF_RANGE", field="sensor")
