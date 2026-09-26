@@ -64,6 +64,14 @@ typedef struct {
     uint16_t      failStreak;       // consecutive non-measurements
     uint32_t      lastInitAttemptMs;
     uint8_t       lastRangeStatus;  // raw 4-bit code from register 0x14
+
+    // BUS_ERROR recovery and diagnostics. See rearTofUpdate().
+    uint16_t      busErrStreak;     // consecutive VL53L0X-transaction BUS_ERRORs
+    uint32_t      busErrTotal;      // every BUS_ERROR, TCA_SELECT included
+    uint8_t       lastBusErrCode;   // raw Wire code, see rear_tof.h
+    uint8_t       lastBusErrSite;   // RearTofBusErrSite
+    uint16_t      reinitCount;      // runtime re-init attempts
+    uint8_t       lastReinitResult; // RearTofReinitResult
 } RearTofSensor;
 
 static RearTofSensor gTof[REAR_TOF_SENSOR_COUNT];
@@ -123,6 +131,23 @@ static void recordFailure(RearTofSensor *s, RearTofStatus why)
 
     if (s->failStreak < 0xFFFF) {
         s->failStreak++;
+    }
+}
+
+
+// A BUS_ERROR, with the evidence kept: which transaction failed and the raw
+// code the Wire driver returned for it. The status and fail streak are set by
+// recordFailure() exactly as for any other BUS_ERROR. The recovery streak is
+// NOT touched here -- rearTofUpdate() owns it, because a TCA select failure is
+// recorded here too and must never count toward re-initialising a sensor.
+static void recordBusError(RearTofSensor *s, RearTofBusErrSite site, uint8_t code)
+{
+    recordFailure(s, TOF_BUS_ERROR);
+
+    s->lastBusErrSite = (uint8_t)site;
+    s->lastBusErrCode = code;
+    if (s->busErrTotal < 0xFFFFFFFFUL) {
+        s->busErrTotal++;
     }
 }
 
@@ -237,6 +262,12 @@ bool rearTofInit(void)
         s->failStreak        = 0;
         s->lastInitAttemptMs = 0;
         s->lastRangeStatus   = 0;
+        s->busErrStreak      = 0;
+        s->busErrTotal       = 0;
+        s->lastBusErrCode    = 0;
+        s->lastBusErrSite    = TOF_BUSERR_NONE;
+        s->reinitCount       = 0;
+        s->lastReinitResult  = TOF_REINIT_NONE;
 
         for (uint8_t k = 0; k < REAR_TOF_SAMPLE_WINDOW; k++) {
             s->samples[k] = REAR_TOF_INVALID_MM;
@@ -261,7 +292,10 @@ bool rearTofInit(void)
         // the same address workable, and it is why initialisation is a loop of
         // select-then-init rather than a batch.
         if (!tcaSelectChannel(s->channel)) {
-            s->status = TOF_BUS_ERROR;
+            s->status         = TOF_BUS_ERROR;
+            s->lastBusErrSite = TOF_BUSERR_TCA_SELECT;    // diagnostics only
+            s->lastBusErrCode = roverI2cLastError();
+            s->busErrTotal++;
             continue;
         }
 
@@ -284,7 +318,10 @@ bool rearTofInit(void)
 // ============================================================================
 
 // Collect one result from an already-selected, already-initialised sensor.
-static void serviceSelected(RearTofSensor *s)
+// Returns true when this visit ended in a VL53L0X-transaction BUS_ERROR, and
+// false for every outcome where the sensor answered (not ready, TIMEOUT,
+// OUT_OF_RANGE, VALID).
+static bool serviceSelected(RearTofSensor *s)
 {
     // Is a measurement ready? In continuous mode the part raises an interrupt
     // status bit when it has one. Polling that bit is a 1-byte read; calling
@@ -293,8 +330,8 @@ static void serviceSelected(RearTofSensor *s)
     uint8_t ready = s->dev.readReg(VL53L0X::RESULT_INTERRUPT_STATUS);
 
     if (s->dev.last_status != 0) {
-        recordFailure(s, TOF_BUS_ERROR);
-        return;
+        recordBusError(s, TOF_BUSERR_READY_REGISTER, s->dev.last_status);
+        return true;
     }
 
     if ((ready & 0x07) == 0) {
@@ -302,7 +339,7 @@ static void serviceSelected(RearTofSensor *s)
         // toward the fail streak: the sensor is working exactly as configured,
         // we just arrived early. Staleness is what catches a sensor that
         // stops producing results altogether.
-        return;
+        return false;
     }
 
     // The 4-bit range status lives in bits 3..6 of RESULT_RANGE_STATUS and is
@@ -310,23 +347,29 @@ static void serviceSelected(RearTofSensor *s)
     // clears the interrupt.
     uint8_t rawStatus = s->dev.readReg(VL53L0X::RESULT_RANGE_STATUS);
     if (s->dev.last_status != 0) {
-        recordFailure(s, TOF_BUS_ERROR);
-        return;
+        recordBusError(s, TOF_BUSERR_RANGE_STATUS, s->dev.last_status);
+        return true;
     }
     s->lastRangeStatus = (uint8_t)((rawStatus >> 3) & 0x0F);
 
+    // Discard a timeout flag left over from an EARLIER call. The library
+    // clears it only in timeoutOccurred(), which the BUS_ERROR return below
+    // skips, and init() never clears it -- so a stale flag would turn this
+    // call's good reading into a false TIMEOUT. The flag checked after the
+    // read then describes this call only.
+    (void)s->dev.timeoutOccurred();
     uint16_t mm = s->dev.readRangeContinuousMillimeters();
 
     if (s->dev.last_status != 0) {
-        recordFailure(s, TOF_BUS_ERROR);
-        return;
+        recordBusError(s, TOF_BUSERR_RANGE_READ, s->dev.last_status);
+        return true;
     }
 
     if (s->dev.timeoutOccurred() || mm == REAR_TOF_TIMEOUT_SENTINEL) {
         // The sensor was addressed but produced nothing in time. Distinct from
         // a bus error (we reached it) and from out-of-range (it answered).
         recordFailure(s, TOF_TIMEOUT);
-        return;
+        return false;
     }
 
 #if REAR_TOF_REQUIRE_RANGE_STATUS_VALID
@@ -335,7 +378,7 @@ static void serviceSelected(RearTofSensor *s)
         // quality criteria. Reported as out-of-range rather than as an error:
         // the hardware is fine, the measurement is not usable.
         recordFailure(s, TOF_OUT_OF_RANGE);
-        return;
+        return false;
     }
 #endif
 
@@ -346,7 +389,7 @@ static void serviceSelected(RearTofSensor *s)
         // not get turned into one.
         recordFailure(s, TOF_OUT_OF_RANGE);
         s->lastRawMm = (int)mm;    // keep it visible for debugging
-        return;
+        return false;
     }
 
     // ---- A real measurement. ----
@@ -361,7 +404,37 @@ static void serviceSelected(RearTofSensor *s)
     }
 
     s->lastGoodMs = millis();
+    return false;
 }
+
+
+#if REAR_TOF_REINIT_AFTER_MS > 0
+// Hand a sensor that initialised, and has since failed on the bus
+// REAR_TOF_BUS_ERROR_REINIT_STREAK visits in a row, back to the throttled
+// re-init branch in rearTofUpdate(). Without this, `initialised` stays true
+// forever and that branch is unreachable for it.
+//
+// The sample window is emptied so a later recovery cannot be filtered together
+// with readings from before the failure: after a successful re-init the sensor
+// needs REAR_TOF_MIN_GOOD_SAMPLES NEW readings before it is valid again.
+//
+// What this deliberately leaves alone: the obstacle latch (safety.cpp owns it
+// and an invalid sensor never changes it), status (still the BUS_ERROR that
+// caused this, until the re-init attempt reports), failStreak and health.
+static void demoteForReinit(RearTofSensor *s)
+{
+    s->initialised  = false;
+    s->busErrStreak = 0;
+
+    for (uint8_t k = 0; k < REAR_TOF_SAMPLE_WINDOW; k++) {
+        s->samples[k] = REAR_TOF_INVALID_MM;
+    }
+    s->writeIndex = 0;
+    s->goodCount  = 0;
+    s->valid      = false;
+    s->filteredMm = REAR_TOF_INVALID_MM;
+}
+#endif
 
 
 void rearTofUpdate(void)
@@ -383,21 +456,48 @@ void rearTofUpdate(void)
     if (!tcaSelectChannel(s->channel)) {
         // We do not know which segment is connected. Abandoning is the only
         // safe option -- reading 0x29 now could be any of the three sensors.
-        recordFailure(s, TOF_BUS_ERROR);
+        //
+        // Recorded for diagnosis, but it neither advances nor resets the
+        // sensor's BUS_ERROR recovery streak: this failure is upstream of the
+        // sensor, and re-initialising the VL53L0X cannot repair it.
+        recordBusError(s, TOF_BUSERR_TCA_SELECT, roverI2cLastError());
         refreshValidity(s);
         return;
     }
 
     if (s->initialised) {
-        serviceSelected(s);
+        // Consecutive VL53L0X-transaction BUS_ERRORs only. Any visit where
+        // the sensor answered -- not ready, TIMEOUT, OUT_OF_RANGE, VALID --
+        // breaks the run.
+        if (serviceSelected(s)) {
+            if (s->busErrStreak < 0xFFFF) {
+                s->busErrStreak++;
+            }
+        } else {
+            s->busErrStreak = 0;
+        }
+
+#if REAR_TOF_REINIT_AFTER_MS > 0
+        if (s->busErrStreak >= REAR_TOF_BUS_ERROR_REINIT_STREAK) {
+            // Nothing is re-initialised HERE. The next visits take the
+            // throttled branch below, at most once per
+            // REAR_TOF_REINIT_AFTER_MS, with this channel selected first.
+            demoteForReinit(s);
+        }
+#endif
     } else {
 #if REAR_TOF_REINIT_AFTER_MS > 0
-        // A dead sensor is retried periodically in case its failure was a
-        // transient power or bus event. This retries the HARDWARE; it never
-        // invents a reading, and until the retry succeeds the sensor keeps
-        // reporting TOF_INIT_FAILED.
+        // A dead or demoted sensor is retried periodically in case its failure
+        // was a transient power or bus event. This retries the HARDWARE; it
+        // never invents a reading. A successful retry does NOT make the sensor
+        // valid -- it still needs fresh readings to fill its empty window.
         if ((millis() - s->lastInitAttemptMs) >= REAR_TOF_REINIT_AFTER_MS) {
-            (void)initOneSelected(s);
+            bool ok = initOneSelected(s);
+
+            if (s->reinitCount < 0xFFFF) {
+                s->reinitCount++;
+            }
+            s->lastReinitResult = ok ? TOF_REINIT_OK : TOF_REINIT_FAILED;
         }
 #endif
     }
@@ -409,11 +509,22 @@ void rearTofUpdate(void)
 
     refreshValidity(s);
 
+    // STICKY FOR THE REST OF THIS BOOT. "Backend up" means the rear backend
+    // came up at least once since rearTofInit() -- NOT "some sensor is
+    // initialised right now". It can become true here (a sensor that failed
+    // at boot initialises later), but runtime demotion or a failed re-init
+    // never makes it false again.
+    //
+    // This is a SAFETY rule. rearTofBackendAvailable() going false makes
+    // safetyReverseBlocked() skip the rear sensors and latches entirely and
+    // fall back to SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED. Losing sensors
+    // at runtime must read as REAR_SENSOR_FAULT (reverse blocked), never as an
+    // unconfigured rear. Only rearTofInit() clears this flag.
     bool anyUp = false;
     for (uint8_t i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
         if (gTof[i].initialised) anyUp = true;
     }
-    gBackendUp = anyUp;
+    gBackendUp = gBackendUp || anyUp;
 }
 
 
@@ -596,6 +707,70 @@ uint8_t rearTofChannelOf(uint8_t index)
 bool rearTofOrientationVerified(void)
 {
     return (REAR_TOF_ORIENTATION_VERIFIED != 0);
+}
+
+bool rearTofInitialised(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return false;
+    return gTof[index].initialised;
+}
+
+uint16_t rearTofBusErrStreak(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return 0;
+    return gTof[index].busErrStreak;
+}
+
+uint32_t rearTofBusErrTotal(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return 0;
+    return gTof[index].busErrTotal;
+}
+
+uint8_t rearTofLastBusErrCode(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return 0;
+    return gTof[index].lastBusErrCode;
+}
+
+RearTofBusErrSite rearTofLastBusErrSite(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return TOF_BUSERR_NONE;
+    return (RearTofBusErrSite)gTof[index].lastBusErrSite;
+}
+
+const char *rearTofBusErrSiteName(RearTofBusErrSite site)
+{
+    switch (site) {
+        case TOF_BUSERR_NONE:           return "NONE";
+        case TOF_BUSERR_TCA_SELECT:     return "TCA_SELECT";
+        case TOF_BUSERR_READY_REGISTER: return "READY_REGISTER";
+        case TOF_BUSERR_RANGE_STATUS:   return "RANGE_STATUS";
+        case TOF_BUSERR_RANGE_READ:     return "RANGE_READ";
+        default:                        return "UNKNOWN";
+    }
+}
+
+uint16_t rearTofReinitCount(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return 0;
+    return gTof[index].reinitCount;
+}
+
+RearTofReinitResult rearTofLastReinitResult(uint8_t index)
+{
+    if (index >= REAR_TOF_SENSOR_COUNT) return TOF_REINIT_NONE;
+    return (RearTofReinitResult)gTof[index].lastReinitResult;
+}
+
+const char *rearTofReinitResultName(RearTofReinitResult r)
+{
+    switch (r) {
+        case TOF_REINIT_NONE:   return "NONE";
+        case TOF_REINIT_OK:     return "OK";
+        case TOF_REINIT_FAILED: return "FAILED";
+        default:                return "UNKNOWN";
+    }
 }
 
 

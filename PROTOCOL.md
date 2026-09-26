@@ -105,6 +105,7 @@ Every frame's first key is `"type"`. The Pi dispatches on `type` alone.
 | `EVENT` | ESP32 → Pi | something happened: `READY`, `COMMAND_TIMEOUT`, `MOTORTEST_DONE`, boot `I2CSCAN` |
 | `TELEMETRY` | ESP32 → Pi | compact operational state, every 200 ms |
 | `DIAG` | ESP32 → Pi | detailed diagnostics, one rotating section every 400 ms |
+| `GPS` | ESP32 → Pi | latest GPS solution and GPS link health, every 1000 ms (§11) |
 
 ## 6. Commands (Pi → ESP32)
 
@@ -266,10 +267,48 @@ Every EVENT carries `seq` (null except `MOTORTEST_DONE`) and `uptime_ms`.
 | Section | Keys |
 |---|---|
 | `FRONT` | `front_left_valid`, `front_right_valid`, `front_left_health`, `front_right_health`, `front_health`, `front_closest_cm`, `sensor_map_verified`; debug: `front_*_raw_cm`, `front_*_samples`, `front_*_timeout_streak` |
-| `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`; debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
+| `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`, BUS_ERROR record per sensor: `rear_bus_err_streak` (consecutive visits ending in a VL53L0X-transaction BUS_ERROR; excludes `TCA_SELECT`; reset by any visit where the sensor answered and by demotion; reaching 50 demotes the sensor to the 5 s throttled re-init), `rear_bus_err_total` (every BUS_ERROR since boot, `TCA_SELECT` included), `rear_bus_err_code` (raw Wire `endTransmission()` code, 0 = none yet: for `TCA_SELECT` the mask write, for `READY_REGISTER` / `RANGE_STATUS` that register's pointer write, for `RANGE_READ` the LAST write inside the library's range read — normally the interrupt clear, not the range data itself; read-phase failures are never reported, and a failed 16-bit range data read surfaces as `TIMEOUT`), `rear_bus_err_site` (site of the latest BUS_ERROR: `NONE`/`TCA_SELECT`/`READY_REGISTER`/`RANGE_STATUS`/`RANGE_READ`), `rear_reinit_count` (runtime re-init attempts by the throttled branch — demoted sensors and sensors that failed boot init; boot init and `TOFTEST` not counted), `rear_reinit_result` (latest such attempt: `NONE`/`OK`/`FAILED`); debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
 | `SYSTEM` | `proto`, `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
 
 Debug keys are controlled by `TELEMETRY_INCLUDE_DEBUG` in `config.h`.
+
+### GPS: every 1000 ms
+
+Sent every `GPS_FRAME_INTERVAL_MS` whatever the GPS state, so `NO_FIX` / `STALE` /
+`BACKOFF` stay visible. Never in the same loop pass as a TELEMETRY or DIAG frame (it goes
+out on the next pass). **Reporting only:** nothing on the ESP32 — safety, motion,
+watchdog — reads GPS state. Source: the u-blox receiver at I2C 0x42, polled for UBX-NAV-PVT
+about once per second by `gps.cpp`; no configuration is ever written to it.
+
+```
+{"type":"GPS","uptime_ms":6252,"gps_status":"OK","fix_type":3,"fix_ok":true,"siv":18,
+ "lat_e7":128998934,"lon_e7":775193730,"alt_msl_mm":861690,"hacc_mm":1500,"vacc_mm":2500,
+ "speed_mm_s":20,"head_mot_e5":34358000,"pdop_e2":120,"itow_ms":123456000,"age_ms":180,
+ "polls":8,"pvt_ok":6,"poll_timeouts":2,"bus_errors":0,"ff_chunks":0,"max_service_us":9810,
+ "latency_ms":40}*XXXX
+```
+
+All values are integers or `null`. About 360–440 bytes.
+
+| Key | Meaning |
+|---|---|
+| `gps_status` | first that applies: `NOT_STARTED` (I2C not ready at boot, bus never touched) · `BACKOFF` (a GPS attempt failed; no GPS bus traffic for 5 s, doubling on each consecutive failure up to 300 s; a successful PVT resets it to 5 s) · `NOT_DETECTED` (no NAV-PVT ever received) · `STALE` (none for ≥ 3000 ms) · `NO_FIX` (`fix_ok` false, or `fix_type` not 2/3/4) · `OK` |
+| `fix_type`, `fix_ok`, `siv` | from the latest NAV-PVT: fixType (0 none, 1 DR, 2 2D, 3 3D, 4 GNSS+DR, 5 time only), flags.gnssFixOK, satellites used. `null` only if no PVT was ever received — so they remain visible in `NO_FIX` and `STALE` |
+| `lat_e7`, `lon_e7` | degrees × 1e-7. **`null` unless `gps_status` is `OK`** |
+| `alt_msl_mm` | height above mean sea level, mm. `null` unless `OK` |
+| `hacc_mm`, `vacc_mm` | horizontal / vertical accuracy estimate, mm. `null` unless `OK` |
+| `speed_mm_s` | 2-D ground speed, mm/s. `null` unless `OK` |
+| `head_mot_e5` | heading of motion, degrees × 1e-5. Meaningless at low speed. `null` unless `OK` |
+| `pdop_e2` | position DOP × 100. `null` unless `OK` |
+| `itow_ms` | GPS time of week of the latest PVT, ms. `null` if none ever |
+| `age_ms` | ms since the latest PVT was received. `null` if none ever |
+| `polls` | NAV-PVT poll requests sent since boot |
+| `pvt_ok` | NAV-PVT solutions received since boot |
+| `poll_timeouts` | polls with no PVT within 500 ms. A poll request whose own write failed also lands here: the library call used to send it cannot report a failed write |
+| `bus_errors` | failed GPS attempts: an I2C transaction that failed, or a single GPS service call longer than 100 ms (a hung transaction; on this ESP32 core one can last ≥ 1 s despite the 50 ms Wire timeout). Each starts a backoff |
+| `ff_chunks` | receive chunks that were entirely 0xFF (module's count said data, stream had none) |
+| `max_service_us` | longest single GPS service call since boot, µs — the GPS's worst contribution to one loop pass |
+| `latency_ms` | poll request → PVT parsed, latest; 0 if none |
 
 ## 12. Boot, READY and resynchronisation
 
@@ -332,7 +371,8 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 |---|---|---|
 | TELEMETRY, typical | 565 | 49.0 ms (24.5 % of its 200 ms slot) |
 | TELEMETRY, worst case (every field at maximum width) | 621 | 53.9 ms (27.0 %) |
-| DIAG FRONT / REAR / SYSTEM | 391 / 480 / ~500–535 | 33.9 / 41.7 / ~46 ms |
+| DIAG FRONT / REAR / SYSTEM | 391 / 730 / ~500–535 | 33.9 / 63.4 / ~46 ms |
+| DIAG REAR, worst case (every field at maximum width) | 849 | 73.7 ms |
 | ACK DRIVE (−255/−255) | 195 | 16.9 ms |
 | ACK PING / STOP | 136 / 174 | 11.8 / 15.1 ms |
 | ERROR (seq null) | 58 | 5.0 ms |
@@ -340,8 +380,9 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 | ACK I2CSCAN, 3 devices / 16 devices (estimate) | 679 / ~1940 | 59 / ~168 ms |
 | Command DRIVE / longest command (MOTORTEST) | 70–75 / 103 | 6.1–6.5 / 8.9 ms |
 
-Steady-state ESP32 → Pi load: fast ≈ 2825 B/s + DIAG ≈ 1170 B/s ≈ **35 %** of the link
-(measured 33–36 %), against ≈ **92 %** for the v1 telemetry line.
+Steady-state ESP32 → Pi load: fast ≈ 2825 B/s + DIAG ≈ 1365 B/s ≈ **36 %** of the link
+(measured 37–39 % including test command traffic), against ≈ **92 %** for the v1
+telemetry line.
 
 **ACK latency, estimated for a physical 115200 link in normal operation** (DRIVE
 command, 70 B up and 195 B back):

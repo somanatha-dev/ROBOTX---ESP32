@@ -58,7 +58,14 @@ void rearTofUpdate(void);
 
 // ---------------------------------------------------------------------------
 // True when the firmware is able to reach the rear sensors at all -- i.e. the
-// TCA9548A address is confirmed and the multiplexer answered.
+// TCA9548A address is confirmed, the multiplexer answered, and the rear
+// backend CAME UP AT LEAST ONCE DURING THIS BOOT (some sensor initialised).
+//
+// It is deliberately NOT "at least one sensor is initialised right now". Once
+// true it stays true until the next rearTofInit(), so a sensor that is later
+// demoted or fails re-initialisation reads as an invalid sensor -- a
+// REAR_SENSOR_FAULT that blocks reverse -- and never as "rear unconfigured",
+// which would hand reverse to SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED.
 //
 // This is a question about the FIRMWARE, not the rover. Three VL53L0X are
 // physically fitted either way.
@@ -126,6 +133,51 @@ uint16_t rearTofFailStreak(uint8_t index);
 
 // The TCA channel this sensor index sits on. Confirmed hardware.
 uint8_t rearTofChannelOf(uint8_t index);
+
+// True while the sensor is initialised. False before boot init, after a
+// failed init, and after a BUS_ERROR demotion until re-init succeeds.
+bool rearTofInitialised(uint8_t index);
+
+// ---------------------------------------------------------------------------
+// BUS_ERROR DIAGNOSTICS
+//
+// Where the most recent BUS_ERROR happened, and the raw code the Wire driver
+// returned for it (esp32 core 2.0.14 endTransmission(): 2 = NACK, 4 = other,
+// 5 = timeout; 0 = no BUS_ERROR recorded yet).
+//
+// LIMITATION: for the VL53L0X sites the code is the Pololu library's
+// last_status, which is ONLY the endTransmission() result of a register-pointer
+// write. The data phase (requestFrom) is never reported. For RANGE_READ it is
+// the LAST such write inside readRangeContinuousMillimeters(), normally the
+// interrupt clear. For TCA_SELECT it is roverI2cLastError() after the mask
+// write.
+// ---------------------------------------------------------------------------
+typedef enum {
+    TOF_BUSERR_NONE = 0,
+    TOF_BUSERR_TCA_SELECT,        // channel-select write to the TCA9548A
+    TOF_BUSERR_READY_REGISTER,    // VL53L0X RESULT_INTERRUPT_STATUS read
+    TOF_BUSERR_RANGE_STATUS,      // VL53L0X RESULT_RANGE_STATUS read
+    TOF_BUSERR_RANGE_READ         // readRangeContinuousMillimeters()
+} RearTofBusErrSite;
+
+typedef enum {
+    TOF_REINIT_NONE = 0,          // no runtime re-init attempted yet
+    TOF_REINIT_OK,
+    TOF_REINIT_FAILED
+} RearTofReinitResult;
+
+// Consecutive VL53L0X-transaction BUS_ERRORs (the recovery trigger). Does NOT
+// count TCA_SELECT, TIMEOUT or OUT_OF_RANGE.
+uint16_t            rearTofBusErrStreak(uint8_t index);
+// Every BUS_ERROR since boot, TCA_SELECT included.
+uint32_t            rearTofBusErrTotal(uint8_t index);
+uint8_t             rearTofLastBusErrCode(uint8_t index);
+RearTofBusErrSite   rearTofLastBusErrSite(uint8_t index);
+const char         *rearTofBusErrSiteName(RearTofBusErrSite site);
+// Runtime re-init attempts made by rearTofUpdate() (boot init not counted).
+uint16_t            rearTofReinitCount(uint8_t index);
+RearTofReinitResult rearTofLastReinitResult(uint8_t index);
+const char         *rearTofReinitResultName(RearTofReinitResult r);
 
 // False until a human confirms which sensor is physically left/centre/right.
 bool rearTofOrientationVerified(void);

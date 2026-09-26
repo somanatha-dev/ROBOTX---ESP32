@@ -11,6 +11,7 @@
 #include "rover_i2c.h"
 #include "tca9548a.h"
 #include "pca9685.h"
+#include "gps.h"
 #include "config.h"
 
 // ============================================================================
@@ -1750,6 +1751,34 @@ static void txDiagRear(void)
        (unsigned)rearTofChannelOf(REAR_TOF_1),
        (unsigned)rearTofChannelOf(REAR_TOF_2));
 #endif
+
+    // BUS_ERROR evidence and runtime re-init record. Not behind
+    // TELEMETRY_INCLUDE_DEBUG: these are fault evidence, not calibration aids.
+    // rear_bus_err_code is the raw Wire code (0 = none yet); see rear_tof.h
+    // for exactly which transaction it describes.
+    tx(",\"rear_bus_err_streak\":[%u,%u,%u],\"rear_bus_err_total\":[%lu,%lu,%lu]"
+       ",\"rear_bus_err_code\":[%u,%u,%u]",
+       (unsigned)rearTofBusErrStreak(REAR_TOF_0),
+       (unsigned)rearTofBusErrStreak(REAR_TOF_1),
+       (unsigned)rearTofBusErrStreak(REAR_TOF_2),
+       (unsigned long)rearTofBusErrTotal(REAR_TOF_0),
+       (unsigned long)rearTofBusErrTotal(REAR_TOF_1),
+       (unsigned long)rearTofBusErrTotal(REAR_TOF_2),
+       (unsigned)rearTofLastBusErrCode(REAR_TOF_0),
+       (unsigned)rearTofLastBusErrCode(REAR_TOF_1),
+       (unsigned)rearTofLastBusErrCode(REAR_TOF_2));
+    tx(",\"rear_bus_err_site\":[");
+    for (uint8_t i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        tx("%s\"%s\"", i ? "," : "", rearTofBusErrSiteName(rearTofLastBusErrSite(i)));
+    }
+    tx("],\"rear_reinit_count\":[%u,%u,%u],\"rear_reinit_result\":[",
+       (unsigned)rearTofReinitCount(REAR_TOF_0),
+       (unsigned)rearTofReinitCount(REAR_TOF_1),
+       (unsigned)rearTofReinitCount(REAR_TOF_2));
+    for (uint8_t i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        tx("%s\"%s\"", i ? "," : "", rearTofReinitResultName(rearTofLastReinitResult(i)));
+    }
+    tx("]");
 }
 
 static void txDiagSystem(void)
@@ -1797,13 +1826,27 @@ static void sendDiag(uint8_t section)
     txEnd();
 }
 
+// GPS (type GPS), every GPS_FRAME_INTERVAL_MS whatever the GPS state, so
+// NO_FIX / STALE / BACKOFF stay visible. Fields are built by gps.cpp.
+static void sendGpsFrame(void)
+{
+    txBegin("GPS", -1);
+    tx(",\"uptime_ms\":%lu", (unsigned long)millis());
+    gpsWriteFrameFields(&gW);
+    txEnd();
+}
+
+static uint32_t gLastGpsFrameMs = 0;
+
 void commServiceTelemetry(void)
 {
-    uint32_t now = millis();
+    uint32_t now  = millis();
+    bool     sent = false;
 
     if (now - gLastFastMs >= TELEMETRY_INTERVAL_MS) {
         gLastFastMs = now;
         sendFastTelemetry();
+        sent = true;
 
         // Schedule the next DIAG section half an interval later, so it never
         // queues directly behind a fast frame.
@@ -1818,6 +1861,14 @@ void commServiceTelemetry(void)
         gDiagPending = false;
         sendDiag(gNextDiagSection);
         gNextDiagSection = (uint8_t)((gNextDiagSection + 1) % DIAG_SECTION_COUNT);
+        sent = true;
+    }
+
+    // Never in the same call as a TELEMETRY or DIAG frame; it simply goes out
+    // on the next pass of loop().
+    if (!sent && now - gLastGpsFrameMs >= GPS_FRAME_INTERVAL_MS) {
+        gLastGpsFrameMs = now;
+        sendGpsFrame();
     }
 }
 

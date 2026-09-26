@@ -15,6 +15,8 @@
 //  VL53L0X by Pololu (Library Manager, or github.com/pololu/vl53l0x-arduino).
 //  It carries ST's device initialisation and tuning sequence, which is several
 //  hundred register writes and is not something to reproduce by hand.
+//  SparkFun u-blox GNSS Arduino Library v2.x (tested: 2.2.29) -- only its
+//  UBX parser is used, by gps.cpp. See gps.h.
 //
 //  DRIVE TYPE  : DIFFERENTIAL. No steering mechanism exists. Every turn is
 //                produced by the difference between left and right wheel
@@ -90,6 +92,7 @@
 #include "tca9548a.h"
 #include "pca9685.h"
 #include "rear_tof.h"
+#include "gps.h"
 
 
 void setup()
@@ -142,6 +145,11 @@ void setup()
     //    they all answer at 0x29, so they can never be initialised together.
     // ------------------------------------------------------------------
     safetyInit();
+
+    // GPS (reporting only). Never calls Wire.begin() and waits for nothing:
+    // one address check plus three UBX-CFG-PRT poll requests, a few ms.
+    gpsInit();
+
     commInit();
 
     // Rover stays STOPPED after startup. STATE_IDLE means "booted, never
@@ -296,7 +304,16 @@ void loop()
     commServiceTelemetry();
 
     // ------------------------------------------------------------------
-    // 8. YIELD
+    // 8. GPS  (reporting only -- nothing above reads it)
+    //    Runs after this pass's safety decision and telemetry. Bounded: one
+    //    poll request or one receive pass of at most GPS_MAX_BYTES_PER_PASS
+    //    bytes, and no bus traffic at all while backing off after a failure.
+    //    Deliberately NOT in the MOTORTEST branch above.
+    // ------------------------------------------------------------------
+    gpsUpdate();
+
+    // ------------------------------------------------------------------
+    // 9. YIELD
     //    Arduino-ESP32 runs loop() as a FreeRTOS task with no implicit yield.
     //    A completely tight loop starves the IDLE task and trips the task
     //    watchdog. delay(1) is a 1 ms vTaskDelay, not a busy wait: the loop

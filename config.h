@@ -123,7 +123,7 @@
 //                               |       +-- CH1 -> VL53L0X #1  @ 0x29
 //                               |       +-- CH2 -> VL53L0X #2  @ 0x29
 //                               |
-//                               +---- NEO-9M GPS   @ 0x42  (not driven here)
+//                               +---- NEO-9M GPS   @ 0x42  (read-only, gps.cpp)
 //
 // All three VL53L0X answer to the SAME address, 0x29. Three identical
 // addresses cannot coexist on one bus segment, which is exactly why the
@@ -216,9 +216,39 @@
 // are undefined and NOTHING here can fix that -- it is a wiring question.
 
 // ---- NEO-9M GPS ------------------------------------------------------------
-// CONFIRMED at 0x42. No driver is implemented (out of scope for this work).
-// Declared so the I2C scanner can name it instead of reporting an unknown.
+// CONFIRMED at 0x42. The exact module/breakout is NOT confirmed (the name is
+// from older documentation). Read by gps.cpp through the SparkFun u-blox GNSS
+// library's UBX parser. NO configuration is ever written to the module: the
+// only messages sent are poll REQUESTS (UBX-NAV-PVT, and three UBX-CFG-PRT
+// polls inside begin()).
 #define NEO9M_I2C_ADDRESS           0x42
+
+// GPS timing. Commissioning values from the design review, NOT measurements.
+// GPS status is REPORTED ONLY -- nothing in safety, motion or the watchdog
+// reads it.
+//
+// Every GPS bus access is bounded: one NAV-PVT poll request per
+// GPS_POLL_PERIOD_MS, then at most one receive pass per
+// GPS_SERVICE_INTERVAL_MS, each pass reading at most GPS_MAX_BYTES_PER_PASS
+// bytes (about 12-13 ms at 100 kHz). A failed transaction stops all GPS bus
+// traffic for GPS_FAIL_BACKOFF_MS, doubling on each consecutive failure up to
+// GPS_BACKOFF_MAX_MS; a good PVT resets it.
+//
+// A hung I2C transaction is NOT bounded by I2C_TIMEOUT_MS on this core: the
+// ESP-IDF 4.4 driver waits at least 1000 ms for a completion interrupt that
+// never comes. gps.cpp cannot shorten that wait, so any gpsUpdate() call that
+// takes longer than GPS_SLOW_CALL_US counts as a failure and backs off, which
+// bounds how OFTEN the GPS can stall the loop.
+#define GPS_POLL_PERIOD_MS          1000UL  // one NAV-PVT poll request per second
+#define GPS_RESPONSE_TIMEOUT_MS     500UL   // give up on a poll after this
+#define GPS_SERVICE_INTERVAL_MS     20UL    // min spacing of receive passes
+#define GPS_STALE_MS                3000UL  // no new PVT for this long -> STALE
+#define GPS_FAIL_BACKOFF_MS         5000UL  // first backoff after a failure
+#define GPS_BACKOFF_MAX_MS          300000UL // backoff doubling cap
+#define GPS_SLOW_CALL_US            100000UL // one gpsUpdate() longer = failed attempt
+#define GPS_MAX_BYTES_PER_PASS      128     // HARD cap on bytes read per pass
+#define GPS_I2C_CHUNK_BYTES         128     // bytes per I2C read; MUST be <= Wire buffer (128): core 2.0.14 requestFrom() does not bound-check
+#define GPS_FRAME_INTERVAL_MS       1000UL  // "type":"GPS" frame period
 
 // ---- VL53L0X ---------------------------------------------------------------
 // CONFIRMED: all three answer at 0x29, the part's power-on default. This
@@ -533,10 +563,28 @@
 // dead. A VL53L0X occasionally needs a second attempt after a cold power rail.
 #define REAR_TOF_INIT_ATTEMPTS      3
 
-// Runtime re-initialisation. A sensor that has been faulty for this long is
-// re-initialised once, in case it was a transient bus or power event. Set to 0
-// to disable. This never fabricates a reading -- it only retries the hardware.
+// Runtime re-initialisation. A sensor that is NOT initialised -- its init
+// failed, or it was demoted by the BUS_ERROR recovery below -- is re-initialised
+// at most once per this interval, in case it was a transient bus or power
+// event. Set to 0 to disable (this also disables the demotion below). This
+// never fabricates a reading -- it only retries the hardware.
 #define REAR_TOF_REINIT_AFTER_MS    5000UL
+
+// Runtime BUS_ERROR recovery. A sensor that initialised successfully and then
+// fails this many VL53L0X bus transactions IN A ROW is demoted to "not
+// initialised", which hands it to the throttled re-init above.
+//
+// Only sensor-transaction BUS_ERRORs count (ready register, range status,
+// range read). TCA channel-select failures, TIMEOUT and OUT_OF_RANGE do not:
+// re-initialising a VL53L0X cannot repair a multiplexer, and a sensor that
+// times out or sees nothing is still answering on the bus.
+//
+// 50 visits is ~3 s at the nominal 60 ms revisit (longer if the loop is slower,
+// e.g. while failing transactions wait out I2C_TIMEOUT_MS). That is far past
+// HEALTH_FAULT (8 visits) and the 600 ms stale limit, so the sensor is already
+// invalid and blocking reverse long before recovery starts, and a transient
+// glitch of a few errors never triggers a re-init.
+#define REAR_TOF_BUS_ERROR_REINIT_STREAK 50
 
 // ---- Rear safety thresholds ------------------------------------------------
 //
@@ -623,6 +671,11 @@ static_assert(REAR_TOF_CONTINUOUS_PERIOD_MS <=
               (REAR_TOF_POLL_INTERVAL_MS * REAR_TOF_SENSOR_COUNT),
               "Continuous period is longer than the round-robin revisit "
               "interval; sensors would be polled before new data exists.");
+static_assert(REAR_TOF_BUS_ERROR_REINIT_STREAK > REAR_TOF_HEALTH_FAULT_STREAK,
+              "BUS_ERROR recovery must not start before the sensor is already "
+              "reported HEALTH_FAULT.");
+static_assert(REAR_TOF_BUS_ERROR_REINIT_STREAK < 0xFFFF,
+              "The BUS_ERROR streak counter is 16-bit and saturates at 0xFFFF.");
 
 
 // ============================================================================

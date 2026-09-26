@@ -9,6 +9,12 @@
      a. default configuration     (PCA9685 unconfirmed -> motion gated, as today)
      b. SIM_DRIVE_AVAILABLE=1     (applied values, deadband, MOTORTEST timing)
      c. drive available + front obstacle at 20 cm (safety-gated ACKs)
+3. rear ToF recovery    -- rear_tof.cpp + safety.cpp + tca9548a.cpp +
+                           rover_i2c.cpp against a fake TCA9548A and three
+                           scriptable VL53L0X (tests/host/test_rear_tof.cpp)
+4. GPS bounded polling  -- gps.cpp + rover_i2c.cpp + protocol.cpp against a
+                           fake u-blox DDC port and the SparkFun library stub
+                           (tests/host/test_gps.cpp)
 
 Build output goes to a temporary directory, never into the repository.
 """
@@ -23,7 +29,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 FIRMWARE = ["comm.cpp", "protocol.cpp", "motor.cpp", "safety.cpp", "rear_tof.cpp",
-            "tca9548a.cpp", "rover_i2c.cpp"]
+            "tca9548a.cpp", "rover_i2c.cpp", "gps.cpp"]
+
+REAR_TOF = ["rear_tof.cpp", "safety.cpp", "tca9548a.cpp", "rover_i2c.cpp"]
+
+GPS = ["gps.cpp", "rover_i2c.cpp", "protocol.cpp"]
 
 SIM_RUNS = [
     ["SIM_ROM_NOISE=1"],
@@ -57,8 +67,23 @@ def main():
             *[os.path.join(ROOT, f) for f in FIRMWARE], "-lwinmm", "-o", sim]):
         return 1
 
+    rear = os.path.join(args.build_dir, "test_rear_tof" + exe)
+    if run([args.cxx, *flags, "-I", os.path.join(HERE, "host", "rear_stubs"),
+            "-I", os.path.join(HERE, "host", "stubs"), "-I", ROOT,
+            os.path.join(HERE, "host", "test_rear_tof.cpp"),
+            *[os.path.join(ROOT, f) for f in REAR_TOF], "-o", rear]):
+        return 1
+
+    gps = os.path.join(args.build_dir, "test_gps" + exe)
+    if run([args.cxx, *flags, "-I", os.path.join(HERE, "host", "stubs"), "-I", ROOT,
+            os.path.join(HERE, "host", "test_gps.cpp"),
+            *[os.path.join(ROOT, f) for f in GPS], "-o", gps]):
+        return 1
+
     failures = 0
     failures += run([unit]) != 0
+    failures += run([rear]) != 0
+    failures += run([gps]) != 0
     for env in SIM_RUNS:
         cmd = [sys.executable, os.path.join(HERE, "test_link.py"), "--sim", sim]
         for kv in env:

@@ -2,8 +2,10 @@
 //  HOST SIMULATION -- hardware below the firmware.
 //
 //  The firmware above this file is REAL: robot_controller.ino, comm.cpp,
-//  protocol.cpp, motor.cpp, safety.cpp, rear_tof.cpp, tca9548a.cpp and
-//  rover_i2c.cpp are compiled unchanged. Only these are simulated:
+//  protocol.cpp, motor.cpp, safety.cpp, rear_tof.cpp, tca9548a.cpp,
+//  rover_i2c.cpp and gps.cpp are compiled unchanged (gps.cpp against the
+//  SparkFun stub in stubs/; 0x42 answers only 1 byte per read here, so the
+//  simulated GPS sits in BACKOFF). Only these are simulated:
 //
 //    * Arduino core  -- millis()/delay() on the wall clock, GPIO as no-ops
 //    * UART0         -- stdin (RX) and stdout (TX), raw bytes
@@ -44,6 +46,15 @@ static double gFrontCm       = 150.0;
 // ---------------------------------------------------------------------------
 
 uint32_t millis(void)                         { return (uint32_t)(timeGetTime() - gStartMs); }
+
+uint32_t micros(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint32_t)((c.QuadPart / f.QuadPart) * 1000000LL +
+                      (c.QuadPart % f.QuadPart) * 1000000LL / f.QuadPart);
+}
 void     delay(uint32_t ms)                   { Sleep(ms); }
 void     delayMicroseconds(uint32_t us)       { (void)us; }
 void     pinMode(uint8_t pin, uint8_t mode)   { (void)pin; (void)mode; }
