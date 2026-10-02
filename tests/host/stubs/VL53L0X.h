@@ -8,6 +8,11 @@
 #include <stdint.h>
 #include "Wire.h"
 
+// Stands in for the PATCHED library (rear_tof.cpp refuses to build without
+// this marker). The guard itself is tested against the real library in
+// tests/host/test_vl53_guard.cpp.
+#define VL53L0X_ROVER_VCSEL_ZERO_GUARD 1
+
 class VL53L0X {
 public:
     enum regAddr {

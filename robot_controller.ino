@@ -202,7 +202,14 @@ void loop()
     //    each behind its own TCA channel. The sensors run in continuous mode,
     //    so this never waits for a measurement. It is a no-op while the
     //    TCA9548A address is unconfirmed.
+    //
+    //    A failed rear sensor's re-init can block for seconds inside the
+    //    VL53L0X library, so it is only permitted while no wheel is driven:
+    //    any such block then happens with every motor enable at zero.
     // ------------------------------------------------------------------
+    rearTofSetReinitPermitted(commAppliedLeft() == 0 &&
+                              commAppliedRight() == 0 &&
+                              !commTestModeActive());
     safetyUpdate();
 
     // ------------------------------------------------------------------

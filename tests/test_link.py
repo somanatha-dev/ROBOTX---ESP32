@@ -27,6 +27,7 @@ TURN_INNER_PCT = 55     # config.h MOTOR_TURN_INNER_PCT
 LINE_MAX = 160          # config.h COMM_LINE_MAX
 ERR_PER_SEC = 10        # config.h COMM_ERROR_FRAMES_PER_SEC
 TIMEOUT_MS = 2000       # config.h COMMAND_TIMEOUT_MS
+CLEAR_ON_BLOCK = True   # config.h SAFETY_CLEAR_COMMAND_ON_BLOCK: a gated command is discarded whole
 
 
 class Fail(Exception):
@@ -157,6 +158,8 @@ def expect_motion(ctx, f, cmd, req_l, req_r):
 
     if (gl, gr) != (req_l, req_r):
         check(f["result"] == "GATED" and f["reason"] != "NONE", f"expected GATED: {f}")
+        if CLEAR_ON_BLOCK:
+            gl, gr = 0, 0
     else:
         ack(f, result="ACCEPTED", reason="NONE")
     check((f["gated_left"], f["gated_right"]) == (gl, gr), f"gated values wrong: {f}")
@@ -172,7 +175,9 @@ def t01_valid_drive(ctx):
     f = ctx.cmd("DRIVE", left=150, right=150)
     expect_motion(ctx, f, "DRIVE", 150, 150)
     tel = ctx.telemetry()
-    check((tel["left_cmd"], tel["right_cmd"]) == (150, 150), f"telemetry left_cmd: {tel}")
+    want = (0, 0) if (CLEAR_ON_BLOCK and f["result"] == "GATED"
+                      and f["reason"] != "MOTOR_PWM_UNAVAILABLE") else (150, 150)
+    check((tel["left_cmd"], tel["right_cmd"]) == want, f"telemetry left_cmd (want {want}): {tel}")
     check((tel["left_applied"], tel["right_applied"]) ==
           (f["applied_left"], f["applied_right"]), "telemetry applied != ack applied")
 
@@ -399,10 +404,16 @@ def t12_garbage(ctx):
 
 def t13_duplicate(ctx):
     ctx.last_tel = ctx.telemetry()
+    # The check below needs a command that stays stored, so it can tell an
+    # executed duplicate STOP apart. A gated command is discarded
+    # (CLEAR_ON_BLOCK), so drive in a direction the gate is not blocking.
+    v = 120
+    if ctx.last_tel["forward_blocked"] and not ctx.last_tel["reverse_blocked"]:
+        v = -120
     s = ctx.next_seq()
-    data = command(s, "DRIVE", left=120, right=120)
+    data = command(s, "DRIVE", left=v, right=v)
     first = ctx.frame_for(data, s)
-    expect_motion(ctx, first, "DRIVE", 120, 120)
+    expect_motion(ctx, first, "DRIVE", v, v)
 
     dup = ack(ctx.frame_for(data, s), result="DUPLICATE", reason="DUPLICATE_SEQ")
     check(dup["original_result"] == first["result"] and dup["original_cmd"] == "DRIVE",
@@ -411,7 +422,7 @@ def t13_duplicate(ctx):
     # Same seq, different content: still a duplicate, and NOT executed.
     dup2 = ack(ctx.frame_for(command(s, "STOP"), s), result="DUPLICATE")
     check(dup2["cmd"] == "STOP" and dup2["original_cmd"] == "DRIVE", f"{dup2}")
-    check(ctx.telemetry()["left_cmd"] == 120, "a duplicate seq was executed")
+    check(ctx.telemetry()["left_cmd"] == v, "a duplicate seq was executed")
     ctx.stop()
 
     # Replay of an OLDER frame after another command: stale, not executed.
@@ -715,6 +726,163 @@ def t24_diagnostics(ctx):
         ack(ctx.cmd("PCATEST", addr=0x40), result="ACCEPTED")
 
 
+def t25_obstacle_no_auto_resume(ctx):
+    # A front obstacle must DISCARD the active DRIVE (SAFETY_CLEAR_COMMAND_ON_BLOCK
+    # = 1): when it clears, the rover stays stopped until a NEW command arrives.
+    # Needs the simulator's SIM_FRONT_CM_FILE to move the obstacle at runtime.
+    if ctx.physical or not ctx.front_file:
+        raise Skip("needs the simulator with SIM_FRONT_CM_FILE")
+    if not ctx.last_tel["motor_drive_available"]:
+        raise Skip("needs SIM_DRIVE_AVAILABLE=1")
+
+    def set_front(cm):
+        with open(ctx.front_file, "w") as fh:
+            fh.write(f"{cm}\n")
+
+    def wait_tel(pred, timeout, what):
+        rec = ctx.link.wait(lambda f: f["type"] == "TELEMETRY" and pred(f), ctx.link.mark(), timeout)
+        check(rec is not None, f"timed out waiting for {what}")
+        return rec.frame
+
+    try:
+        set_front(150)
+        wait_tel(lambda f: f["front_valid"] and not f["front_obstacle"] and not f["forward_blocked"],
+                 3.0, "a clear front path")
+
+        # 1. DRIVE active.
+        f = ack(ctx.cmd("DRIVE", left=120, right=120), result="ACCEPTED")
+        check((f["applied_left"], f["applied_right"]) == (120, 120), f"DRIVE not applied: {f}")
+        wait_tel(lambda f: (f["left_applied"], f["right_applied"]) == (120, 120), 1.0, "applied 120/120")
+
+        # 2. Obstacle appears: power cut AND the stored command discarded.
+        set_front(20)
+        tel = wait_tel(lambda f: f["front_obstacle"] and (f["left_applied"], f["right_applied"]) == (0, 0),
+                       2.0, "obstacle stop")
+        # With the command discarded, the next pass gates nothing, so the
+        # reported state settles to STOPPED; the obstacle and the sticky
+        # safety_stop record carry the information.
+        check(tel["state"] in ("SAFETY_STOP", "STOPPED"), f"state during obstacle: {tel['state']}")
+        blocked_tel = wait_tel(lambda f: f["front_obstacle"], 0.5, "telemetry during obstacle")
+        check(blocked_tel["safety_stop"] is True and blocked_tel["forward_blocked"] is True,
+              f"obstacle stop not recorded: {blocked_tel}")
+        check((blocked_tel["left_applied"], blocked_tel["right_applied"]) == (0, 0),
+              f"power during obstacle: {blocked_tel}")
+
+        # 3. A refresh while the obstacle remains is gated and moves nothing.
+        f = ack(ctx.cmd("DRIVE", left=120, right=120), result="GATED", reason="FRONT_OBSTACLE")
+        check((f["applied_left"], f["applied_right"]) == (0, 0), f"gated refresh applied power: {f}")
+        t_refresh = time.monotonic()
+
+        # 4. Obstacle clears. The latch releases while the refresh above would
+        #    still be inside the watchdog window, so only the discard can be
+        #    what keeps the rover stopped.
+        set_front(150)
+        mark = ctx.link.mark()
+        rel = wait_tel(lambda f: not f["front_obstacle"] and not f["forward_blocked"], 2.0, "latch release")
+        released = time.monotonic() - t_refresh
+        check(released < TIMEOUT_MS / 1000 - 0.4,
+              f"latch released {released:.2f}s after the refresh: too late to prove anything")
+        hold_until = t_refresh + TIMEOUT_MS / 1000 - 0.2
+        while time.monotonic() < hold_until:
+            time.sleep(0.05)
+        after = [r.frame for r in ctx.link.frames(mark, ftype="TELEMETRY")]
+        check(len(after) >= 3, f"only {len(after)} TELEMETRY frames after release")
+        for t in after:
+            check(not t["command_timeout"], f"watchdog fired; the test proves nothing: {t}")
+            check((t["left_applied"], t["right_applied"]) == (0, 0),
+                  f"AUTO-RESUME after obstacle release: {t}")
+        for t in after:
+            check((t["left_cmd"], t["right_cmd"]) == (0, 0), f"old command still stored: {t}")
+        check((blocked_tel["left_cmd"], blocked_tel["right_cmd"]) == (0, 0),
+              f"blocked command was not discarded: {blocked_tel}")
+        ctx.stats["obstacle_release_after_refresh_s"] = round(released, 3)
+        ctx.stats["frames_held_stopped_after_release"] = len(after)
+        check(rel["safety_stop"] is True, f"sticky safety_stop record missing: {rel}")
+
+        # 5. A NEW DRIVE is required -- and sufficient -- to move again.
+        f = ack(ctx.cmd("DRIVE", left=120, right=120), result="ACCEPTED")
+        check((f["applied_left"], f["applied_right"]) == (120, 120), f"fresh DRIVE not applied: {f}")
+        wait_tel(lambda f: (f["left_applied"], f["right_applied"]) == (120, 120), 1.0,
+                 "motion from the fresh DRIVE")
+
+        # 6. STOP still works.
+        ctx.stop()
+        wait_tel(lambda f: (f["left_applied"], f["right_applied"]) == (0, 0) and f["state"] == "STOPPED",
+                 1.0, "STOPPED")
+    finally:
+        set_front(150)
+
+
+def t26_gated_mixed_no_output(ctx):
+    # A mixed-direction DRIVE that the gate blocks on ONE side must be
+    # discarded whole with NO motor output at all -- not even a transient
+    # write to the unblocked side before the discard. Needs the simulator's
+    # SIM_FRONT_CM_FILE (move the obstacle) and SIM_PCA_LOG_FILE (non-zero
+    # PCA9685 duty writes, i.e. motor output).
+    if ctx.physical or not ctx.front_file or not ctx.pca_log:
+        raise Skip("needs the simulator with SIM_FRONT_CM_FILE and SIM_PCA_LOG_FILE")
+    if not ctx.last_tel["motor_drive_available"]:
+        raise Skip("needs SIM_DRIVE_AVAILABLE=1")
+
+    def set_front(cm):
+        with open(ctx.front_file, "w") as fh:
+            fh.write(f"{cm}\n")
+
+    def log_size():
+        try:
+            with open(ctx.pca_log, "rb") as fh:
+                return len(fh.read())
+        except FileNotFoundError:
+            return 0
+
+    def log_since(offset):
+        try:
+            with open(ctx.pca_log, "rb") as fh:
+                return fh.read()[offset:].decode("ascii").split()
+        except FileNotFoundError:
+            return []
+
+    def wait_tel(pred, timeout, what):
+        rec = ctx.link.wait(lambda f: f["type"] == "TELEMETRY" and pred(f), ctx.link.mark(), timeout)
+        check(rec is not None, f"timed out waiting for {what}")
+        return rec.frame
+
+    try:
+        # Positive control: with the path clear the same command DOES write
+        # motor output, so an empty log below means "no output", not "no log".
+        set_front(150)
+        ctx.stop()
+        wait_tel(lambda f: not f["forward_blocked"] and not f["reverse_blocked"], 3.0, "a clear path")
+        off = log_size()
+        ack(ctx.cmd("DRIVE", left=-120, right=120), result="ACCEPTED")
+        time.sleep(0.2)
+        check(len(log_since(off)) > 0, "positive control: an accepted DRIVE logged no motor output")
+        ctx.stop()
+
+        # Front obstacle: forward blocked, reverse allowed (no rear backend in
+        # the simulator), so each mixed command is blocked on exactly ONE side.
+        set_front(20)
+        tel = wait_tel(lambda f: f["front_obstacle"] and f["forward_blocked"], 2.0, "front obstacle")
+        if tel["reverse_blocked"]:
+            raise Skip("reverse is blocked too; no partially-blocked command possible")
+        time.sleep(0.2)
+
+        for l, r in ((-120, 120), (120, -120)):
+            off = log_size()
+            f = ack(ctx.cmd("DRIVE", left=l, right=r), result="GATED", reason="FRONT_OBSTACLE")
+            check((f["gated_left"], f["gated_right"]) == (0, 0), f"gated must be 0/0: {f}")
+            check((f["applied_left"], f["applied_right"]) == (0, 0), f"applied must be 0/0: {f}")
+            time.sleep(0.3)             # several loop passes after the ACK
+            tel = wait_tel(lambda f: True, 0.5, "telemetry")
+            check((tel["left_cmd"], tel["right_cmd"]) == (0, 0), f"command not discarded: {tel}")
+            check((tel["left_applied"], tel["right_applied"]) == (0, 0), f"power applied: {tel}")
+            out = log_since(off)
+            check(not out, f"TRANSIENT MOTOR OUTPUT for gated DRIVE {l}/{r}: "
+                           f"(ms ch duty) {out[:12]}")
+    finally:
+        set_front(150)
+
+
 TESTS = [
     ("01 valid DRIVE", t01_valid_drive),
     ("02 valid STOP", t02_stop),
@@ -740,6 +908,8 @@ TESTS = [
     ("22 READY / boot noise", t22_ready_and_noise),
     ("23 MOTORTEST validation", t23_motortest),
     ("24 diagnostics", t24_diagnostics),
+    ("25 obstacle: no auto-resume", t25_obstacle_no_auto_resume),
+    ("26 gated mixed: no output", t26_gated_mixed_no_output),
 ]
 
 
@@ -763,6 +933,8 @@ def main():
         label = "UART " + args.port
     link = rl.Link(transport)
     ctx = Ctx(link, physical=bool(args.port))
+    ctx.front_file = env.get("SIM_FRONT_CM_FILE") if args.sim else None
+    ctx.pca_log = env.get("SIM_PCA_LOG_FILE") if args.sim else None
 
     try:
         # Let boot output settle and front sensors fill their windows.

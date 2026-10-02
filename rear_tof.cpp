@@ -2,6 +2,16 @@
 #include <Wire.h>
 #include <VL53L0X.h>
 
+// The installed Pololu VL53L0X library must carry the rover's one-line patch:
+// setMeasurementTimingBudget() returns false on a zero VCSEL period instead of
+// dividing by zero. A failed I2C read produces exactly that (0xFF), and the
+// division is reachable from inside init() as well as from initOneSelected(),
+// so it cannot be guarded from this file. Captured on the rover 2026-10-02:
+// IntegerDivideByZero in timeoutMicrosecondsToMclks(), then a reboot.
+#ifndef VL53L0X_ROVER_VCSEL_ZERO_GUARD
+#error "VL53L0X library lacks the rover VCSEL divide-by-zero guard - see rear_tof.cpp"
+#endif
+
 #include "rear_tof.h"
 #include "tca9548a.h"
 #include "rover_i2c.h"
@@ -79,6 +89,7 @@ static RearTofSensor gTof[REAR_TOF_SENSOR_COUNT];
 static uint8_t  gActive      = 0;
 static uint32_t gNextPollMs  = 0;
 static bool     gBackendUp   = false;
+static bool     gReinitPermitted = true;    // see rearTofSetReinitPermitted()
 
 
 // ============================================================================
@@ -200,7 +211,16 @@ static bool initOneSelected(RearTofSensor *s)
         // A VL53L0X coming off a cold power rail sometimes needs a second
         // attempt. Retrying is honest -- it is the same question asked again,
         // not a different answer substituted.
-        if (s->dev.init(REAR_TOF_IO_2V8 != 0)) {
+        uint32_t started = millis();
+        bool     ok      = s->dev.init(REAR_TOF_IO_2V8 != 0);
+
+        // A slow attempt hung on the bus: its result is not trusted and no
+        // further attempt is made now. See REAR_TOF_INIT_SLOW_MS.
+        if ((millis() - started) > REAR_TOF_INIT_SLOW_MS) {
+            break;
+        }
+
+        if (ok) {
 
             if (!s->dev.setMeasurementTimingBudget(REAR_TOF_TIMING_BUDGET_US)) {
                 // The part came up but would not accept its timing budget.
@@ -491,7 +511,12 @@ void rearTofUpdate(void)
         // was a transient power or bus event. This retries the HARDWARE; it
         // never invents a reading. A successful retry does NOT make the sensor
         // valid -- it still needs fresh readings to fill its empty window.
-        if ((millis() - s->lastInitAttemptMs) >= REAR_TOF_REINIT_AFTER_MS) {
+        //
+        // Only while permitted (no wheel driven): a faulty sensor can hold one
+        // library init() on the bus for many seconds, and nothing can cut it
+        // short. Deferred, not skipped -- it runs on the first permitted visit.
+        if (gReinitPermitted &&
+            (millis() - s->lastInitAttemptMs) >= REAR_TOF_REINIT_AFTER_MS) {
             bool ok = initOneSelected(s);
 
             if (s->reinitCount < 0xFFFF) {
@@ -582,6 +607,11 @@ uint8_t rearTofReadAll(uint16_t *distancesMm, RearTofStatus *statuses)
 bool rearTofBackendAvailable(void)
 {
     return tcaAddressConfirmed() && tcaPresent() && gBackendUp;
+}
+
+void rearTofSetReinitPermitted(bool permitted)
+{
+    gReinitPermitted = permitted;
 }
 
 bool rearTofAnyValid(void)

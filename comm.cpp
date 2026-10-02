@@ -639,14 +639,16 @@ static void applyMotion(int left, int right)
     if (gl != left || gr != right) {
         const char *reason = safetyBlockReason(left, right);
 
-        driveDifferential(gl, gr);
-
 #if SAFETY_CLEAR_COMMAND_ON_BLOCK
+        // Discarded BEFORE any motor write: the unblocked side of a
+        // partially-gated command must not get even a transient output.
         gDesiredLeft  = 0;
         gDesiredRight = 0;
         stopMotors();
         gl = 0;
         gr = 0;
+#else
+        driveDifferential(gl, gr);
 #endif
 
         commLatchSafetyStop();

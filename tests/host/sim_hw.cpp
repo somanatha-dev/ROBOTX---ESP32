@@ -19,6 +19,10 @@
 //  Environment variables:
 //    SIM_DRIVE_AVAILABLE  0 (default, matches the rover today) or 1
 //    SIM_FRONT_CM         simulated front distance in cm (default 150)
+//    SIM_FRONT_CM_FILE    optional file holding the front distance in cm; a
+//                         test rewrites it to move the obstacle at runtime
+//    SIM_PCA_LOG_FILE     optional file; every non-zero PCA9685 duty write is
+//                         appended to it (motor output, for no-output proofs)
 //    SIM_ROM_NOISE        1 = print ESP32-boot-ROM-style text before setup()
 // ============================================================================
 
@@ -61,9 +65,32 @@ void     pinMode(uint8_t pin, uint8_t mode)   { (void)pin; (void)mode; }
 void     digitalWrite(uint8_t pin, uint8_t v) { (void)pin; (void)v; }
 int      digitalRead(uint8_t pin)             { (void)pin; return HIGH; }
 
+// SIM_FRONT_CM_FILE: a test rewrites this file to move the simulated obstacle
+// while the sketch runs. Re-read at most every 20 ms; unreadable -> unchanged.
+static const char *gFrontFile   = NULL;
+static uint32_t    gFrontReadMs = 0;
+
+static void refreshFrontCm(void)
+{
+    if (gFrontFile == NULL || (millis() - gFrontReadMs) < 20) {
+        return;
+    }
+    gFrontReadMs = millis();
+    FILE *f = fopen(gFrontFile, "r");
+    if (f == NULL) {
+        return;
+    }
+    double cm = 0.0;
+    if (fscanf(f, "%lf", &cm) == 1) {
+        gFrontCm = cm;
+    }
+    fclose(f);
+}
+
 unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeoutUs)
 {
     (void)pin; (void)state;
+    refreshFrontCm();
     if (gFrontCm <= 0.0) {
         return 0;                                   // no echo
     }
@@ -209,7 +236,21 @@ bool        pca9685AddressConfirmed(void) { return gDriveAvailable; }
 uint8_t     pca9685Address(void)          { return 0x40; }
 bool        pca9685Ready(void)            { return gDriveAvailable; }
 const char *pca9685StatusName(void)       { return gDriveAvailable ? "OK" : "ADDRESS_UNCONFIRMED"; }
-bool        pca9685SetDuty(uint8_t ch, uint16_t duty) { (void)ch; (void)duty; return gDriveAvailable; }
+// SIM_PCA_LOG_FILE: every NON-ZERO duty write is appended as "ms ch duty", so a
+// test can prove that no motor output was produced, even transiently.
+static const char *gPcaLogFile = NULL;
+
+bool pca9685SetDuty(uint8_t ch, uint16_t duty)
+{
+    if (gPcaLogFile != NULL && gDriveAvailable && duty != 0) {
+        FILE *f = fopen(gPcaLogFile, "a");
+        if (f != NULL) {
+            fprintf(f, "%lu %u %u\n", (unsigned long)millis(), (unsigned)ch, (unsigned)duty);
+            fclose(f);
+        }
+    }
+    return gDriveAvailable;
+}
 bool        pca9685AllOff(void)           { return gDriveAvailable; }
 
 bool pca9685ProbeCandidate(uint8_t address, uint8_t *mode1Out, uint8_t *prescaleOut)
@@ -239,6 +280,8 @@ int main(void)
     const char *e;
     if ((e = getenv("SIM_DRIVE_AVAILABLE")) != NULL) gDriveAvailable = (atoi(e) != 0);
     if ((e = getenv("SIM_FRONT_CM"))        != NULL) gFrontCm        = atof(e);
+    if ((e = getenv("SIM_FRONT_CM_FILE"))   != NULL) gFrontFile      = e;
+    if ((e = getenv("SIM_PCA_LOG_FILE"))    != NULL) gPcaLogFile     = e;
 
     if ((e = getenv("SIM_ROM_NOISE")) != NULL && atoi(e) != 0) {
         static const char kRom[] =

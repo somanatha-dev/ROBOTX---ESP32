@@ -13,7 +13,14 @@
 #include <stdint.h>
 #include "Wire.h"
 
+// Stands in for the PATCHED library (rear_tof.cpp refuses to build without
+// this marker). The guard itself is tested against the real library in
+// tests/host/test_vl53_guard.cpp; here simTofSetBudget() returning false
+// models what the patched setMeasurementTimingBudget() does on bad VCSEL data.
+#define VL53L0X_ROVER_VCSEL_ZERO_GUARD 1
+
 bool     simTofInit(uint8_t *status);
+bool     simTofSetBudget(void);
 uint8_t  simTofReadReg(uint8_t reg, uint8_t *status);
 uint16_t simTofReadRange(uint8_t *status, bool *timedOut);
 
@@ -36,7 +43,7 @@ public:
     void     setBus(TwoWire *bus)                    { (void)bus; }
     void     setTimeout(uint16_t ms)                 { (void)ms; }
     bool     init(bool io2v8 = true)                 { (void)io2v8; return simTofInit(&last_status); }
-    bool     setMeasurementTimingBudget(uint32_t us) { (void)us; return true; }
+    bool     setMeasurementTimingBudget(uint32_t us) { (void)us; return simTofSetBudget(); }
     void     startContinuous(uint32_t periodMs = 0)  { (void)periodMs; }
     uint8_t  readReg(uint8_t reg)                    { return simTofReadReg(reg, &last_status); }
     uint16_t readRangeSingleMillimeters(void)        { return readRangeContinuousMillimeters(); }

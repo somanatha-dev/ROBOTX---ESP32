@@ -72,6 +72,13 @@ void rearTofUpdate(void);
 // ---------------------------------------------------------------------------
 bool rearTofBackendAvailable(void);
 
+// Whether the throttled RUNTIME re-init of a failed sensor may run. loop()
+// sets this every pass: true only while no wheel is being driven, because a
+// faulty sensor can block one library init() for many seconds. While false,
+// re-init is deferred, never dropped. Boot init and TOFTEST are not affected.
+// Default true.
+void rearTofSetReinitPermitted(bool permitted);
+
 // True when at least one sensor currently holds a trustworthy reading.
 bool rearTofAnyValid(void);
 

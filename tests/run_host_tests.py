@@ -7,7 +7,11 @@
 2. link tests (3 runs)   -- the REAL sketch compiled into a host simulator
                             (tests/host/sim_hw.cpp) and driven over stdin/stdout:
      a. default configuration     (PCA9685 unconfirmed -> motion gated, as today)
-     b. SIM_DRIVE_AVAILABLE=1     (applied values, deadband, MOTORTEST timing)
+     b. SIM_DRIVE_AVAILABLE=1     (applied values, deadband, MOTORTEST timing,
+                                   and -- via SIM_FRONT_CM_FILE -- an obstacle that
+                                   appears and clears at runtime: no auto-resume;
+                                   via SIM_PCA_LOG_FILE -- no motor output from a
+                                   partially-blocked mixed-direction DRIVE)
      c. drive available + front obstacle at 20 cm (safety-gated ACKs)
 3. rear ToF recovery    -- rear_tof.cpp + safety.cpp + tca9548a.cpp +
                            rover_i2c.cpp against a fake TCA9548A and three
@@ -15,6 +19,11 @@
 4. GPS bounded polling  -- gps.cpp + rover_i2c.cpp + protocol.cpp against a
                            fake u-blox DDC port and the SparkFun library stub
                            (tests/host/test_gps.cpp)
+5. VL53L0X VCSEL guard   -- the REAL installed Pololu library (--vl53-lib,
+                           default: the sketchbook's libraries/VL53L0X) against
+                           a fake sensor whose VCSEL period read fails
+                           (tests/host/test_vl53_guard.cpp). An unpatched
+                           library crashes this test with a divide-by-zero.
 
 Build output goes to a temporary directory, never into the repository.
 """
@@ -37,7 +46,7 @@ GPS = ["gps.cpp", "rover_i2c.cpp", "protocol.cpp"]
 
 SIM_RUNS = [
     ["SIM_ROM_NOISE=1"],
-    ["SIM_DRIVE_AVAILABLE=1"],
+    ["SIM_DRIVE_AVAILABLE=1", "SIM_FRONT_CM_FILE={front_file}", "SIM_PCA_LOG_FILE={pca_log}"],
     ["SIM_DRIVE_AVAILABLE=1", "SIM_FRONT_CM=20"],
 ]
 
@@ -51,6 +60,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cxx", default="g++")
     ap.add_argument("--build-dir", default=os.path.join(tempfile.gettempdir(), "rover_host_build"))
+    ap.add_argument("--vl53-lib", default=os.path.join(os.path.dirname(ROOT), "libraries", "VL53L0X"))
     args = ap.parse_args()
     os.makedirs(args.build_dir, exist_ok=True)
 
@@ -80,14 +90,29 @@ def main():
             *[os.path.join(ROOT, f) for f in GPS], "-o", gps]):
         return 1
 
+    # The real library: its own directory first, so the stub VL53L0X.h in
+    # stubs/ is NOT used here. -Dboolean=bool: the library uses Arduino's type.
+    vl53 = os.path.join(args.build_dir, "test_vl53_guard" + exe)
+    if run([args.cxx, *flags, "-Dboolean=bool", "-I", args.vl53_lib,
+            "-I", os.path.join(HERE, "host", "stubs"),
+            os.path.join(HERE, "host", "test_vl53_guard.cpp"),
+            os.path.join(args.vl53_lib, "VL53L0X.cpp"), "-o", vl53]):
+        return 1
+
     failures = 0
     failures += run([unit]) != 0
     failures += run([rear]) != 0
     failures += run([gps]) != 0
+    failures += run([vl53]) != 0
+    front_file = os.path.join(args.build_dir, "sim_front_cm.txt")
+    pca_log = os.path.join(args.build_dir, "sim_pca_nonzero.log")
     for env in SIM_RUNS:
+        with open(front_file, "w") as fh:
+            fh.write("150\n")
+        open(pca_log, "w").close()
         cmd = [sys.executable, os.path.join(HERE, "test_link.py"), "--sim", sim]
         for kv in env:
-            cmd += ["--sim-env", kv]
+            cmd += ["--sim-env", kv.format(front_file=front_file, pca_log=pca_log)]
         failures += run(cmd) != 0
 
     print("HOST TESTS:", "ALL PASSED" if failures == 0 else f"{failures} suite(s) FAILED")

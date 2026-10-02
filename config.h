@@ -188,7 +188,7 @@
 // this chip, driving the direction pins without a verified enable source would
 // be commanding a motor through hardware nobody has identified.
 #define PCA9685_I2C_ADDRESS         0x40
-#define PCA9685_ADDRESS_CONFIRMED   0       // <-- SET TO 1 ONLY AFTER PCATEST
+#define PCA9685_ADDRESS_CONFIRMED   1       // <-- SET TO 1 ONLY AFTER PCATEST
 
 // PWM frequency presented to the L298N ENA/ENB inputs.
 //
@@ -258,7 +258,7 @@
 
 
 // ============================================================================
-//  M O T O R   M A P   --   *** UNVERIFIED. YOU MUST CONFIRM THIS. ***
+//  M O T O R   M A P   --   VERIFIED 2026-10-02 (MOTORTEST, ON BLOCKS)
 // ============================================================================
 //
 // THIS IS THE SINGLE PLACE where motor grouping (which channel is LEFT and
@@ -267,21 +267,36 @@
 //
 // A GPIO list CANNOT tell us two things:
 //
-//   (1) SIDE   - is FRONT_A the front-LEFT wheel or the front-RIGHT wheel?
-//                Nothing in the pin numbering implies this. It depends on
-//                which driver output terminal each motor was screwed into.
+//   (1) SIDE   - which physical wheel does each channel drive? Nothing in the
+//                pin numbering implies this. It depends on which driver
+//                output terminal each motor was screwed into.
 //
 //   (2) INVERT - does driving IN1 with IN2 low spin that wheel FORWARD or
 //                BACKWARD? That depends on which way round the two motor
 //                leads went into the terminal block. A swapped pair reverses
 //                the wheel.
 //
-// That is 2 side-assignments x 2^4 polarities = 64 possible mappings. The
-// values below are a PLACEHOLDER ASSUMPTION, not a measurement:
-//     "A" channels = LEFT, "B" channels = RIGHT, no inversion.
+// NOTE: FRONT_A/FRONT_B/REAR_A/REAR_B name the L298N BOARD and output, NOT the
+// wheel position. The "FRONT" board drives the REAR wheels.
 //
-// Resolve it with the MOTORTEST command, rover ON BLOCKS. Then edit the table
-// below and set MOTOR_MAP_VERIFIED to 1.
+// MOTORTEST COMMISSIONING RESULT, 2026-10-02, rover on blocks, top view,
+// forward = toward the rover's front:
+//
+//   motor  channel  PCA  wheel        side   +power   -power          polarity
+//   -----  -------  ---  -----------  -----  -------  --------------  ------------------
+//     0    FRONT_A  CH0  REAR-LEFT    LEFT   back     forward (-80)   VERIFIED, invert 1
+//     1    FRONT_B  CH1  REAR-RIGHT   RIGHT  back     forward (-80)   VERIFIED, invert 1
+//     2    REAR_A   CH2  FRONT-RIGHT  RIGHT  back     forward (-80)*  VERIFIED, invert 1
+//     3    REAR_B   CH3  FRONT-LEFT   LEFT   back     forward (-120)  VERIFIED, invert 1
+//
+//   * about half a wheel turn, then vibration.
+//   M3 at -80 only buzzed; its reversal was confirmed in a separate +120 /
+//   -120 test (1000 ms each).
+//
+// All four SIDES and all four POLARITIES are verified, so MOTOR_MAP_VERIFIED
+// is 1. The build refuses MOTOR_MAP_VERIFIED 1 while any
+// MOTOR_*_POLARITY_VERIFIED is 0; if a motor is ever rewired, clear its flag
+// (and MOTOR_MAP_VERIFIED) and re-run MOTORTEST on blocks.
 //
 // Until MOTOR_MAP_VERIFIED is 1, telemetry reports "motor_map_verified":false
 // so the Raspberry Pi can refuse to run autonomously on an unverified rover.
@@ -290,19 +305,33 @@
 #define MOTOR_SIDE_LEFT     0
 #define MOTOR_SIDE_RIGHT    1
 
-#define MOTOR_MAP_VERIFIED  0
+#define MOTOR_MAP_VERIFIED  1
 
-//                          <-- VERIFY  (MOTOR_SIDE_LEFT / MOTOR_SIDE_RIGHT)
-#define MOTOR_FRONT_A_SIDE  MOTOR_SIDE_LEFT
-#define MOTOR_FRONT_B_SIDE  MOTOR_SIDE_RIGHT
-#define MOTOR_REAR_A_SIDE   MOTOR_SIDE_LEFT
-#define MOTOR_REAR_B_SIDE   MOTOR_SIDE_RIGHT
+//                          VERIFIED 2026-10-02  (MOTOR_SIDE_LEFT / MOTOR_SIDE_RIGHT)
+#define MOTOR_FRONT_A_SIDE  MOTOR_SIDE_LEFT     // motor 0, rear-left
+#define MOTOR_FRONT_B_SIDE  MOTOR_SIDE_RIGHT    // motor 1, rear-right
+#define MOTOR_REAR_A_SIDE   MOTOR_SIDE_RIGHT    // motor 2, front-right
+#define MOTOR_REAR_B_SIDE   MOTOR_SIDE_LEFT     // motor 3, front-left
 
-//                          <-- VERIFY  (0 = as wired, 1 = reverse this wheel)
-#define MOTOR_FRONT_A_INVERT 0
-#define MOTOR_FRONT_B_INVERT 0
-#define MOTOR_REAR_A_INVERT  0
-#define MOTOR_REAR_B_INVERT  0
+//                          (0 = as wired, 1 = reverse this wheel)
+#define MOTOR_FRONT_A_INVERT 1                  // motor 0, VERIFIED
+#define MOTOR_FRONT_B_INVERT 1                  // motor 1, VERIFIED
+#define MOTOR_REAR_A_INVERT  1                  // motor 2, VERIFIED
+#define MOTOR_REAR_B_INVERT  1                  // motor 3, VERIFIED
+
+// 1 only when that channel's INVERT value was confirmed on blocks in BOTH
+// directions (+power one way, -power the other).
+#define MOTOR_FRONT_A_POLARITY_VERIFIED 1
+#define MOTOR_FRONT_B_POLARITY_VERIFIED 1
+#define MOTOR_REAR_A_POLARITY_VERIFIED  1
+#define MOTOR_REAR_B_POLARITY_VERIFIED  1       // M3: +120 back, -120 forward
+
+#if MOTOR_MAP_VERIFIED && !(MOTOR_FRONT_A_POLARITY_VERIFIED && \
+                            MOTOR_FRONT_B_POLARITY_VERIFIED && \
+                            MOTOR_REAR_A_POLARITY_VERIFIED  && \
+                            MOTOR_REAR_B_POLARITY_VERIFIED)
+#error "MOTOR_MAP_VERIFIED cannot be 1 while a motor's polarity is unverified."
+#endif
 
 
 // ============================================================================
@@ -563,6 +592,13 @@
 // dead. A VL53L0X occasionally needs a second attempt after a cold power rail.
 #define REAR_TOF_INIT_ATTEMPTS      3
 
+// An init attempt that takes longer than this contained at least one hung I2C
+// transaction (the ESP-IDF driver waits >= 1000 ms for each; a healthy init
+// is well under 100 ms -- the whole boot reaches READY in ~300 ms). Such an
+// attempt is a failure whatever init() returned: the sensor's configuration
+// cannot be trusted, and retrying at once would only block the loop again.
+#define REAR_TOF_INIT_SLOW_MS       500UL
+
 // Runtime re-initialisation. A sensor that is NOT initialised -- its init
 // failed, or it was demoted by the BUS_ERROR recovery below -- is re-initialised
 // at most once per this interval, in case it was a transient bus or power
@@ -676,6 +712,9 @@ static_assert(REAR_TOF_BUS_ERROR_REINIT_STREAK > REAR_TOF_HEALTH_FAULT_STREAK,
               "reported HEALTH_FAULT.");
 static_assert(REAR_TOF_BUS_ERROR_REINIT_STREAK < 0xFFFF,
               "The BUS_ERROR streak counter is 16-bit and saturates at 0xFFFF.");
+static_assert(REAR_TOF_INIT_SLOW_MS < 1000UL,
+              "REAR_TOF_INIT_SLOW_MS must be below the 1000 ms ESP-IDF hang "
+              "floor, or one hung transaction would not be detected.");
 
 
 // ============================================================================
@@ -769,7 +808,7 @@ static_assert(US_MIN_GOOD_SAMPLES <= US_SAMPLE_WINDOW,
 //   1          : yes. Motion can never resume without a brand-new command.
 //                Note this also defeats COMPONENT gating, because the stored
 //                command becomes (0,0) after the first blocked pass.
-#define SAFETY_CLEAR_COMMAND_ON_BLOCK 0
+#define SAFETY_CLEAR_COMMAND_ON_BLOCK 1
 
 
 // ============================================================================

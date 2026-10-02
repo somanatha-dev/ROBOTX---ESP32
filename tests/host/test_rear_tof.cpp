@@ -140,6 +140,10 @@ struct SimTof {
     uint8_t  errCode;
     int      initCalls;
     uint32_t initTimes[SIM_MAX_INIT_LOG];
+    uint32_t initDelayMs;   // clock advance per init(): models hung transactions
+    bool     budgetOk;      // setMeasurementTimingBudget() result (false = the
+                            // patched library refusing a zero VCSEL period)
+    int      budgetCalls;
 };
 
 static SimTof gSim[REAR_TOF_SENSOR_COUNT];
@@ -186,8 +190,20 @@ bool simTofInit(uint8_t *status)
         t.initTimes[t.initCalls] = gNow;
     }
     t.initCalls++;
+    gNow += t.initDelayMs;
     *status = t.initOk ? 0 : 2;
     return t.initOk;
+}
+
+bool simTofSetBudget(void)
+{
+    int i = openSensor();
+    if (i < 0) {
+        gBadSelect++;
+        return false;
+    }
+    gSim[i].budgetCalls++;
+    return gSim[i].budgetOk;
 }
 
 uint8_t simTofReadReg(uint8_t reg, uint8_t *status)
@@ -270,7 +286,11 @@ static void resetSim(void)
         gSim[i].mm        = 1000;
         gSim[i].errCode   = 2;
         gSim[i].initCalls = 0;
+        gSim[i].initDelayMs = 0;
+        gSim[i].budgetOk    = true;
+        gSim[i].budgetCalls = 0;
     }
+    rearTofSetReinitPermitted(true);
 }
 
 // The rear-relevant part of setup(), in setup()'s order.
@@ -830,6 +850,116 @@ static void testM(void)
 
 typedef void (*TestFn)(void);
 
+// ---------------------------------------------------------------------------
+// N. A hung init() that FAILS (CH1, 2026-10-02): one attempt, then a safe fault
+//
+// initDelayMs models one hung I2C transaction (the ESP-IDF 1 s floor). Real
+// init() hangs come from inside the library; only the elapsed time is modelled.
+// ---------------------------------------------------------------------------
+static void testN(void)
+{
+    resetSim();
+    gSim[1].initOk      = false;
+    gSim[1].initDelayMs = 1000;
+    boot();
+
+    CHECK(gSim[1].initCalls == 1, "slow failing attempt was retried at once");
+    CHECK(gSim[1].budgetCalls == 0, "timing budget set after a failed init");
+    CHECK(!rearTofInitialised(1), "slow sensor initialised");
+    CHECK(rearTofStatusOf(1) == TOF_INIT_FAILED, "status");
+    CHECK(gSim[0].initCalls == 1 && gSim[2].initCalls == 1, "healthy sensors re-tried");
+    CHECK(gSim[0].budgetCalls == 1 && gSim[2].budgetCalls == 1, "healthy path changed");
+
+    run(1500);
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors not valid");
+    CHECK(!rearTofValid(1), "failed sensor valid");
+    CHECK(safetyRearSensorFault(), "rear fault not reported");
+    CHECK(safetyReverseBlocked(), "reverse open with a failed rear sensor");
+
+    // Runtime: every throttled re-init is a single attempt as well.
+    CHECK(runUntil([] { return rearTofReinitCount(1) == 2; }, 30000), "no re-init");
+    CHECK(gSim[1].initCalls == 3, "runtime re-init retried a slow attempt");
+    CHECK(rearTofLastReinitResult(1) == TOF_REINIT_FAILED, "re-init result");
+    CHECK(safetyReverseBlocked(), "reverse open after failed re-inits");
+}
+
+// ---------------------------------------------------------------------------
+// O. A hung init() that RETURNS TRUE: not trusted, not configured, not retried
+// ---------------------------------------------------------------------------
+static void testO(void)
+{
+    resetSim();
+    gSim[1].initOk      = true;
+    gSim[1].initDelayMs = 1000;
+    boot();
+
+    CHECK(gSim[1].initCalls == 1, "slow attempt was retried at once");
+    CHECK(gSim[1].budgetCalls == 0, "slow init's sensor was configured anyway");
+    CHECK(!rearTofInitialised(1), "slow init accepted");
+    CHECK(rearTofStatusOf(1) == TOF_INIT_FAILED, "status");
+    run(1500);
+    CHECK(safetyReverseBlocked(), "reverse open with an untrusted sensor");
+
+    // Recovery is kept: once init is fast again, the throttled re-init works.
+    gSim[1].initDelayMs = 0;
+    CHECK(runUntil([] { return rearTofValid(1); }, 20000), "never recovered");
+    CHECK(rearTofLastReinitResult(1) == TOF_REINIT_OK, "re-init result");
+    CHECK(gSim[1].budgetCalls == 1, "timing budget not set on the good init");
+}
+
+// ---------------------------------------------------------------------------
+// P. Timing budget refused (patched library, invalid VCSEL period): INIT_FAILED
+// ---------------------------------------------------------------------------
+static void testP(void)
+{
+    resetSim();
+    gSim[1].budgetOk = false;
+    boot();
+
+    CHECK(gSim[1].initCalls == REAR_TOF_INIT_ATTEMPTS, "fast failures not retried");
+    CHECK(gSim[1].budgetCalls == REAR_TOF_INIT_ATTEMPTS, "budget not attempted each time");
+    CHECK(!rearTofInitialised(1), "sensor with a refused budget initialised");
+    CHECK(rearTofStatusOf(1) == TOF_INIT_FAILED, "status");
+    CHECK(gSim[0].budgetCalls == 1 && gSim[2].budgetCalls == 1, "healthy path changed");
+
+    run(1500);
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors disturbed");
+    CHECK(safetyRearSensorFault(), "rear fault not reported");
+    CHECK(safetyReverseBlocked(), "reverse open");
+    int l = 1, r = 1;
+    safetyGateMotion(-100, -100, &l, &r);
+    CHECK(l == 0 && r == 0, "reverse not gated");
+    safetyGateMotion(100, 100, &l, &r);
+    CHECK(l == 100 && r == 100, "forward gated by a rear fault");
+}
+
+// ---------------------------------------------------------------------------
+// Q. Runtime re-init only while permitted (no wheel driven); boot unaffected
+// ---------------------------------------------------------------------------
+static void testQ(void)
+{
+    resetSim();
+    gSim[1].initOk = false;
+    rearTofSetReinitPermitted(false);       // boot init must not depend on it
+    boot();
+    CHECK(gSim[0].initCalls == 1 && gSim[2].initCalls == 1, "boot init gated");
+    CHECK(gSim[1].initCalls == REAR_TOF_INIT_ATTEMPTS, "boot init of sensor 1 gated");
+    const int bootCalls = gSim[1].initCalls;
+
+    run(20000);                             // wheels driven: not permitted
+    CHECK(rearTofReinitCount(1) == 0, "re-init ran while not permitted");
+    CHECK(gSim[1].initCalls == bootCalls, "init() called while not permitted");
+    CHECK(safetyReverseBlocked(), "reverse open");
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors disturbed");
+
+    gSim[1].initOk = true;
+    rearTofSetReinitPermitted(true);        // stopped: the deferred re-init runs
+    CHECK(runUntil([] { return rearTofReinitCount(1) == 1; }, 200),
+          "deferred re-init did not run on the first permitted visit");
+    CHECK(rearTofLastReinitResult(1) == TOF_REINIT_OK, "re-init result");
+    CHECK(runUntil([] { return rearTofValid(1); }, 2000), "never recovered");
+}
+
 int main(void)
 {
     static const struct { const char *name; TestFn fn; } kTests[] = {
@@ -846,6 +976,10 @@ int main(void)
         { "K  TCA select failures not counted",           testK },
         { "L  diagnostics: site + raw code",              testL },
         { "M  stale timeout flag cleared before read",    testM },
+        { "N  hung init fails: one attempt, safe fault",  testN },
+        { "O  hung init 'succeeds': rejected",            testO },
+        { "P  refused timing budget: safe fault",         testP },
+        { "Q  re-init only while permitted",              testQ },
     };
 
     int failedTests = 0;
