@@ -599,16 +599,36 @@
 // cannot be trusted, and retrying at once would only block the loop again.
 #define REAR_TOF_INIT_SLOW_MS       500UL
 
-// Runtime re-initialisation. A sensor that is NOT initialised -- its init
-// failed, or it was demoted by the BUS_ERROR recovery below -- is re-initialised
-// at most once per this interval, in case it was a transient bus or power
-// event. Set to 0 to disable (this also disables the demotion below). This
-// never fabricates a reading -- it only retries the hardware.
+// Runtime re-initialisation from loop(). OFF (RX-01).
+//
+// The VL53L0X library's init() is synchronous and cannot be cut short: on a
+// faulty sensor one call held the bus for >= 1 s on the rover (2026-10-02,
+// TCA ch1), and nothing bounds it. Called from loop(), it stopped EVERYTHING
+// for that time -- UART commands, TELEMETRY, front pings, the command
+// watchdog -- and the Pi saw the link go stale. So a sensor whose boot init
+// failed, or that is demoted below, now STAYS failed until the next boot: it
+// reads as REAR_SENSOR_FAULT, which keeps reverse blocked. Recovery is a
+// power cycle (or the operator-initiated TOFTEST diagnostic).
+//
+// 1 restores the old throttled runtime re-init (one attempt per
+// REAR_TOF_REINIT_AFTER_MS, only while no wheel is driven). It BLOCKS the
+// control loop for as long as init() takes; it is kept only so that path
+// stays compiled and tested (tests/run_host_tests.py builds it), not for use.
+#ifndef REAR_TOF_RUNTIME_REINIT
+#define REAR_TOF_RUNTIME_REINIT     0
+#endif
+
+// Re-init throttle, used only when REAR_TOF_RUNTIME_REINIT is 1: a sensor that
+// is NOT initialised is re-initialised at most once per this interval. Setting
+// it to 0 also disables the BUS_ERROR demotion below. This never fabricates a
+// reading -- it only retries the hardware.
 #define REAR_TOF_REINIT_AFTER_MS    5000UL
 
-// Runtime BUS_ERROR recovery. A sensor that initialised successfully and then
+// Runtime BUS_ERROR demotion. A sensor that initialised successfully and then
 // fails this many VL53L0X bus transactions IN A ROW is demoted to "not
-// initialised", which hands it to the throttled re-init above.
+// initialised": it is no longer polled (each failing poll costs a bus
+// timeout), and it stays failed until the next boot -- or, with
+// REAR_TOF_RUNTIME_REINIT 1, is handed to the throttled re-init above.
 //
 // Only sensor-transaction BUS_ERRORs count (ready register, range status,
 // range read). TCA channel-select failures, TIMEOUT and OUT_OF_RANGE do not:
@@ -676,19 +696,21 @@
 
 // REVERSE POLICY WHILE REAR SENSING IS UNAVAILABLE
 // ------------------------------------------------
-// "Unavailable" now means one specific thing: TCA9548A_ADDRESS_CONFIRMED is 0,
-// so the firmware cannot legitimately reach the sensors.
+// "Unavailable" means rearTofBackendAvailable() is false: the TCA9548A address
+// is unconfirmed, OR the TCA9548A did not answer at boot, OR no rear sensor
+// initialised at boot. (Sensors that fail AFTER the backend came up are a
+// different case -- REAR_SENSOR_FAULT, reverse blocked whatever this says.)
+// With runtime re-initialisation off (REAR_TOF_RUNTIME_REINIT 0), a backend
+// that did not come up at boot stays unavailable until the next boot.
 //
-// 0 : reverse is PERMITTED but UNGUARDED. Telemetry states this plainly via
-//     "reverse_guarded":false. Preserves the ability to back away from
-//     whatever tripped the front safety stop.
-// 1 : reverse is REFUSED entirely. Safer; the rover cannot retreat under its
-//     own power.
+// 0 : reverse is PERMITTED and UNGUARDED -- no rear sensor checks it at all.
+// 1 : reverse is REFUSED (block reason REAR_UNCONFIGURED). The rover cannot
+//     retreat under its own power until rear sensing comes up.
 //
-// LEFT AT 0 -- the pre-existing operator decision is preserved unchanged.
-// Once you confirm the TCA address this setting stops mattering, because the
-// real sensors take over the gate.
-#define SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED 0
+// SET TO 1 (RX-05). The TCA9548A address is confirmed and the rear sensors are
+// commissioned, so a rear that is not there is a fault, not a design choice;
+// and the Pi's obstacle-avoidance pivots drive one side in reverse.
+#define SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED 1
 
 // ---- Compile-time sanity on the rear thresholds ----------------------------
 static_assert(REAR_STOP_DISTANCE_MM < REAR_CLEAR_DISTANCE_MM,
@@ -888,6 +910,11 @@ static_assert(SERIAL_TX_BUFFER_BYTES > COMM_TX_FRAME_MAX,
 // ("Bandwidth"). Do NOT raise the baud rate: it is part of the Pi contract.
 #define TELEMETRY_INTERVAL_MS        200UL
 #define TELEMETRY_DIAG_EVERY_N_FAST  2
+
+// A loop() pass at least this long is recorded as a stall in DIAG SYSTEM
+// (last_stall_ms / last_stall_source / stall_count). A normal pass takes a few
+// ms; one front pulseIn() is at most US_ECHO_TIMEOUT_US (20 ms).
+#define LOOP_STALL_THRESHOLD_MS      50UL
 
 // TELEMETRY_INCLUDE_DEBUG adds the calibration fields to the DIAG FRONT and
 // REAR sections -- raw samples, good-sample counts, timeout streaks, rear raw

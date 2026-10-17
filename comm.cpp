@@ -15,6 +15,40 @@
 #include "config.h"
 
 // ============================================================================
+// FIRMWARE BUILD IDENTITY (RX-15)
+// ============================================================================
+//
+// Reported as "fw_build" / "fw_build_utc" in EVENT READY and DIAG SYSTEM, so
+// the Pi can tell WHICH build is running. Supplied by the build, never written
+// here:
+//
+//   * tools/gen_fw_build_id.py writes fw_build_id.h (git-ignored) next to the
+//     sketch -- the source revision (`git rev-parse`, plus "-dirty" when the
+//     tree differs from it) and the UTC time it was generated. Run it before
+//     every build that is to be flashed. Or
+//   * the build passes -DFW_BUILD_ID="..." (and optionally -DFW_BUILD_UTC).
+//
+// With neither, the build says so: "unversioned" / "unknown". That is the
+// truthful answer for a build nobody stamped -- never a fixed version string
+// that every future build would repeat. Values must be plain ASCII without
+// quotes or backslashes (the generator guarantees it).
+// ============================================================================
+
+#ifndef FW_BUILD_ID
+#  if defined(__has_include)
+#    if __has_include("fw_build_id.h")
+#      include "fw_build_id.h"
+#    endif
+#  endif
+#endif
+#ifndef FW_BUILD_ID
+#  define FW_BUILD_ID  "unversioned"
+#endif
+#ifndef FW_BUILD_UTC
+#  define FW_BUILD_UTC "unknown"
+#endif
+
+// ============================================================================
 // STATE (single definition -- nothing else defines these)
 // ============================================================================
 
@@ -547,6 +581,21 @@ void commUpdateRuntime(int gatedLeft, int gatedRight, const char *blockReason)
 int         commAppliedLeft(void)  { return gAppliedLeft;  }
 int         commAppliedRight(void) { return gAppliedRight; }
 const char *commBlockReason(void)  { return gBlockReason;  }
+
+// Is the rover under live motion control right now? True while a MOTORTEST
+// runs, while any wheel is commanded or driven, and while the command watchdog
+// is armed -- a movement command (STOP included) arrived within
+// COMMAND_TIMEOUT_MS and it has not timed out. The Pi streams STOP/DRIVE every
+// ~100 ms whenever it has motion enabled, so this is "the Pi is in control".
+// Used to refuse diagnostics that can stall loop().
+static bool motionControlActive(void)
+{
+    if (gTestActive) return true;
+    if (gDesiredLeft != 0 || gDesiredRight != 0) return true;
+    if (gAppliedLeft != 0 || gAppliedRight != 0) return true;
+    return gEverReceivedCmd && !gTimedOut &&
+           (millis() - gLastCommandMs) <= COMMAND_TIMEOUT_MS;
+}
 
 
 // ============================================================================
@@ -1235,6 +1284,17 @@ static void handleTofTest(void)
         return;
     }
 
+    // TOFTEST blocks loop() while it runs: a single-shot range read on every
+    // sensor it tests, plus a full VL53L0X library init() on one that is not
+    // initialised -- seconds on a faulty sensor, with nothing able to cut it
+    // short (RX-01). While a stall would freeze the command watchdog, the
+    // safety gate and TELEMETRY under live control, it is refused. Run it
+    // after the motion commands stop and the 2 s watchdog has expired.
+    if (motionControlActive()) {
+        ackReject("REFUSED_MOTION_CONTROL_ACTIVE", NULL);
+        return;
+    }
+
     ackBegin("ACCEPTED", "NONE");
     tx(",\"tca_addr\":\"0x%02X\"", tcaAddress());
     txBool("orientation_verified", rearTofOrientationVerified());
@@ -1584,6 +1644,8 @@ void commEmitReady(void)
     txSeq(-1);
     tx(",\"uptime_ms\":%lu,\"proto\":%d", (unsigned long)millis(), PROTO_VERSION);
     txStr("fw", "rover-esp32");
+    txStr("fw_build", FW_BUILD_ID);
+    txStr("fw_build_utc", FW_BUILD_UTC);
     txStr("core", "2.0.14");
     txStr("drive", "DIFFERENTIAL");
     tx(",\"seq_min\":%d,\"seq_max\":%ld,\"line_max\":%d",
@@ -1783,9 +1845,90 @@ static void txDiagRear(void)
     tx("]");
 }
 
+// ============================================================================
+// LOOP TIMING  (DIAG SYSTEM)
+// ============================================================================
+//
+// Evidence for RX-01: how long one pass of loop() takes, and which section
+// made the slowest one slow. "Since boot" figures are never reset, so the
+// worst stall stays visible however late the Pi starts listening.
+//
+//   loop_max_ms / loop_max_source  longest pass since boot, and its slowest
+//                                  section
+//   last_stall_ms / _source / _uptime_ms
+//                                  latest pass >= LOOP_STALL_THRESHOLD_MS
+//   stall_count                    passes >= LOOP_STALL_THRESHOLD_MS since boot
+// ============================================================================
+
+static uint32_t    gPassStartMs      = 0;
+static uint32_t    gSectionStartMs   = 0;
+static uint32_t    gNestedMs         = 0;   // charged by commLoopNested()
+static uint32_t    gPassSlowestMs    = 0;
+static const char *gPassSlowest      = "NONE";
+
+static uint32_t    gLoopMaxMs        = 0;
+static const char *gLoopMaxSource    = "NONE";
+static uint32_t    gLastStallMs      = 0;
+static const char *gLastStallSource  = "NONE";
+static uint32_t    gLastStallUptime  = 0;
+static uint32_t    gStallCount       = 0;
+
+static void noteSection(const char *source, uint32_t ms)
+{
+    if (ms > gPassSlowestMs) {
+        gPassSlowestMs = ms;
+        gPassSlowest   = source;
+    }
+}
+
+void commLoopBegin(void)
+{
+    gPassStartMs    = millis();
+    gSectionStartMs = gPassStartMs;
+    gNestedMs       = 0;
+    gPassSlowestMs  = 0;
+    gPassSlowest    = "NONE";
+}
+
+void commLoopNested(const char *source, uint32_t ms)
+{
+    noteSection(source, ms);
+    gNestedMs += ms;
+}
+
+void commLoopMark(const char *source)
+{
+    uint32_t now     = millis();
+    uint32_t elapsed = now - gSectionStartMs;
+    noteSection(source, (elapsed > gNestedMs) ? (elapsed - gNestedMs) : 0);
+    gNestedMs       = 0;
+    gSectionStartMs = now;
+}
+
+void commLoopEnd(void)
+{
+    uint32_t now   = millis();
+    uint32_t total = now - gPassStartMs;
+
+    if (total > gLoopMaxMs) {
+        gLoopMaxMs     = total;
+        gLoopMaxSource = gPassSlowest;
+    }
+    if (total >= LOOP_STALL_THRESHOLD_MS) {
+        gLastStallMs     = total;
+        gLastStallSource = gPassSlowest;
+        gLastStallUptime = now;
+        if (gStallCount < 0xFFFFFFFFUL) {
+            gStallCount++;
+        }
+    }
+}
+
 static void txDiagSystem(void)
 {
     tx(",\"proto\":%d", PROTO_VERSION);
+    txStr("fw_build", FW_BUILD_ID);
+    txStr("fw_build_utc", FW_BUILD_UTC);
     txBool("i2c_ready", roverI2cReady());
     txStr("tca_status", tcaStatusName());
     txStr("pca_status", pca9685StatusName());
@@ -1795,6 +1938,13 @@ static void txDiagSystem(void)
     txBool("motor_map_verified", motorMapVerified());
     txBool("command_ever_received", gEverReceivedCmd);
     tx(",\"left_gated\":%d,\"right_gated\":%d", gGatedLeft, gGatedRight);
+
+    tx(",\"loop_max_ms\":%lu", (unsigned long)gLoopMaxMs);
+    txStr("loop_max_source", gLoopMaxSource);
+    tx(",\"last_stall_ms\":%lu", (unsigned long)gLastStallMs);
+    txStr("last_stall_source", gLastStallSource);
+    tx(",\"last_stall_uptime_ms\":%lu,\"stall_count\":%lu",
+       (unsigned long)gLastStallUptime, (unsigned long)gStallCount);
 
     tx(",\"link\":{\"rx_ok\":%lu,\"rx_empty\":%lu,\"rx_bad_frame\":%lu,"
        "\"rx_bad_crc\":%lu,\"rx_bad_message\":%lu,\"rx_too_long\":%lu,"

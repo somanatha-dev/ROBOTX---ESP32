@@ -69,6 +69,19 @@ void commPoll(void);
 void commServiceTelemetry(void);
 
 // ---------------------------------------------------------------------------
+// Loop timing, reported in DIAG SYSTEM (loop_max_ms, last_stall_*). loop()
+// brackets each pass with commLoopBegin() / commLoopEnd() and calls
+// commLoopMark(source) as each section ends. commLoopNested(source, ms)
+// charges time a sub-step inside the current section measured itself (the
+// rear ToF half of safetyUpdate()), so a stall is named after that sub-step
+// and not after the whole section. Arithmetic only: nothing here blocks.
+// ---------------------------------------------------------------------------
+void commLoopBegin(void);
+void commLoopNested(const char *source, uint32_t ms);
+void commLoopMark(const char *source);
+void commLoopEnd(void);
+
+// ---------------------------------------------------------------------------
 // Process one received line (without its '\n'). commPoll() calls this; it is
 // exposed so the host tests can drive the protocol directly.
 // ---------------------------------------------------------------------------

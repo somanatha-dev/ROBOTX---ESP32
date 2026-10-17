@@ -687,6 +687,13 @@ void safetyInit(void)
 // SCHEDULED UPDATE
 // ============================================================================
 
+static uint32_t gLastRearUpdateMs = 0;
+
+uint32_t safetyLastRearUpdateMs(void)
+{
+    return gLastRearUpdateMs;
+}
+
 void safetyUpdate(void)
 {
     // ------------------------------------------------------------------
@@ -701,8 +708,10 @@ void safetyUpdate(void)
     // US_PING_INTERVAL_MS, and the rear gate must not inherit the front
     // sensor's cadence.
     // ------------------------------------------------------------------
+    uint32_t rearStartMs = millis();
     rearTofUpdate();
     rearLatchUpdate();
+    gLastRearUpdateMs = millis() - rearStartMs;
 
     // Signed comparison handles millis() rollover correctly.
     if ((int32_t)(millis() - gNextPingMs) < 0) {

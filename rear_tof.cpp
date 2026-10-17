@@ -429,10 +429,11 @@ static bool serviceSelected(RearTofSensor *s)
 
 
 #if REAR_TOF_REINIT_AFTER_MS > 0
-// Hand a sensor that initialised, and has since failed on the bus
-// REAR_TOF_BUS_ERROR_REINIT_STREAK visits in a row, back to the throttled
-// re-init branch in rearTofUpdate(). Without this, `initialised` stays true
-// forever and that branch is unreachable for it.
+// Retire a sensor that initialised, and has since failed on the bus
+// REAR_TOF_BUS_ERROR_REINIT_STREAK visits in a row: it is no longer polled, so
+// it stops costing a bus timeout on every visit. With REAR_TOF_RUNTIME_REINIT
+// 0 (the default) it stays failed until the next boot; with 1 it is handed to
+// the throttled re-init branch in rearTofUpdate().
 //
 // The sample window is emptied so a later recovery cannot be filtered together
 // with readings from before the failure: after a successful re-init the sensor
@@ -499,14 +500,17 @@ void rearTofUpdate(void)
 
 #if REAR_TOF_REINIT_AFTER_MS > 0
         if (s->busErrStreak >= REAR_TOF_BUS_ERROR_REINIT_STREAK) {
-            // Nothing is re-initialised HERE. The next visits take the
-            // throttled branch below, at most once per
-            // REAR_TOF_REINIT_AFTER_MS, with this channel selected first.
+            // Nothing is re-initialised HERE (see demoteForReinit()).
             demoteForReinit(s);
         }
 #endif
     } else {
-#if REAR_TOF_REINIT_AFTER_MS > 0
+#if REAR_TOF_REINIT_AFTER_MS > 0 && REAR_TOF_RUNTIME_REINIT
+        // RX-01: compiled out by default (config.h REAR_TOF_RUNTIME_REINIT).
+        // With it off, a dead or demoted sensor is left alone here: it keeps
+        // its failure status, reads as REAR_SENSOR_FAULT and keeps reverse
+        // blocked, and nothing on this path can stall loop().
+        //
         // A dead or demoted sensor is retried periodically in case its failure
         // was a transient power or bus event. This retries the HARDWARE; it
         // never invents a reading. A successful retry does NOT make the sensor

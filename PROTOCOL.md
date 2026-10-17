@@ -132,7 +132,7 @@ rejected with `UNKNOWN_FIELD`.** Ranges are inclusive, and values outside them a
 | `I2CSTATUS` | — | SDA/SCL pad levels, no bus traffic | no |
 | `TCATEST` | `addr` int 8…119 (optional; the configured address once it is confirmed) | TCA9548A read-back test | no |
 | `PCATEST` | `addr` int 8…119 (optional, as above) | read-only PCA9685 probe | no |
-| `TOFTEST` | `sensor` int 0…2 (optional; all three if absent) | one blocking VL53L0X read each | no |
+| `TOFTEST` | `sensor` int 0…2 (optional; all three if absent) | one blocking VL53L0X read each, plus a full library `init()` of a sensor that is not initialised (seconds on a faulty one). **Refused** `REFUSED_MOTION_CONTROL_ACTIVE` while a MOTORTEST runs, a wheel is commanded or driven, or a movement command (STOP included) arrived within the 2 s watchdog window; send it once the Pi has stopped commanding and `command_timeout` is set | no |
 | `HWREPORT` | — | configuration and the list of what is unverified | no |
 
 Diagnostic results are carried **inside the ACK**, so every command still gets exactly one
@@ -215,6 +215,11 @@ deadband (|v| < 40 → 0) or through drive being unavailable.
 GATED reasons: `MOTOR_PWM_UNAVAILABLE`, `FRONT_OBSTACLE`, `FRONT_SENSOR_FAULT`,
 `REAR_OBSTACLE`, `REAR_SENSOR_FAULT`, `REAR_UNCONFIGURED`.
 
+`REAR_UNCONFIGURED`: rear sensing never came up this boot (TCA9548A address unconfirmed, the
+TCA9548A did not answer, or no rear sensor initialised). Any reverse wheel is then refused
+(`config.h` `SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED 1`); before this firmware revision it
+was permitted unguarded.
+
 ## 10. ERROR and EVENT
 
 ```
@@ -228,7 +233,13 @@ seq when the lost frame was an ACK, and replaces that frame; a truncated frame i
 
 | EVENT | When | Extra keys |
 |---|---|---|
-| `READY` | once, at the end of `setup()` | `proto`, `fw`, `core`, `seq_min`, `seq_max`, `line_max`, hardware status |
+| `READY` | once, at the end of `setup()` | `proto`, `fw` (always `"rover-esp32"`, the firmware family), `fw_build`, `fw_build_utc`, `core`, `seq_min`, `seq_max`, `line_max`, hardware status |
+
+`fw_build` identifies the build: the 12-hex-digit source revision, with `-dirty` when the
+tree did not match it, written by `tools/gen_fw_build_id.py` before the build (or passed as
+`-DFW_BUILD_ID`); `"unversioned"` for a build nobody stamped, `"nogit"` when the generator
+found no git revision. `fw_build_utc` is when the stamp was made (`"unknown"` when unstamped).
+Both also appear in DIAG SYSTEM, so the build can be read at any time, not only at boot.
 | `I2CSCAN` | once at boot (`trigger":"BOOT"`) | scan result |
 | `COMMAND_TIMEOUT` | watchdog trips (false → true transition; again after a RESET) | `command_age_ms`, `timeout_ms` |
 | `MOTORTEST_DONE` | a test ends | `seq` of the MOTORTEST, `reason` `EXPIRED`/`CANCELLED`/`REPLACED` |
@@ -267,8 +278,8 @@ Every EVENT carries `seq` (null except `MOTORTEST_DONE`) and `uptime_ms`.
 | Section | Keys |
 |---|---|
 | `FRONT` | `front_left_valid`, `front_right_valid`, `front_left_health`, `front_right_health`, `front_health`, `front_closest_cm`, `sensor_map_verified`; debug: `front_*_raw_cm`, `front_*_samples`, `front_*_timeout_streak` |
-| `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`, BUS_ERROR record per sensor: `rear_bus_err_streak` (consecutive visits ending in a VL53L0X-transaction BUS_ERROR; excludes `TCA_SELECT`; reset by any visit where the sensor answered and by demotion; reaching 50 demotes the sensor to the 5 s throttled re-init), `rear_bus_err_total` (every BUS_ERROR since boot, `TCA_SELECT` included), `rear_bus_err_code` (raw Wire `endTransmission()` code, 0 = none yet: for `TCA_SELECT` the mask write, for `READY_REGISTER` / `RANGE_STATUS` that register's pointer write, for `RANGE_READ` the LAST write inside the library's range read — normally the interrupt clear, not the range data itself; read-phase failures are never reported, and a failed 16-bit range data read surfaces as `TIMEOUT`), `rear_bus_err_site` (site of the latest BUS_ERROR: `NONE`/`TCA_SELECT`/`READY_REGISTER`/`RANGE_STATUS`/`RANGE_READ`), `rear_reinit_count` (runtime re-init attempts by the throttled branch — demoted sensors and sensors that failed boot init; boot init and `TOFTEST` not counted), `rear_reinit_result` (latest such attempt: `NONE`/`OK`/`FAILED`); debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
-| `SYSTEM` | `proto`, `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
+| `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`, BUS_ERROR record per sensor: `rear_bus_err_streak` (consecutive visits ending in a VL53L0X-transaction BUS_ERROR; excludes `TCA_SELECT`; reset by any visit where the sensor answered and by demotion; reaching 50 demotes the sensor: it is no longer polled and stays failed until the next boot), `rear_bus_err_total` (every BUS_ERROR since boot, `TCA_SELECT` included), `rear_bus_err_code` (raw Wire `endTransmission()` code, 0 = none yet: for `TCA_SELECT` the mask write, for `READY_REGISTER` / `RANGE_STATUS` that register's pointer write, for `RANGE_READ` the LAST write inside the library's range read — normally the interrupt clear, not the range data itself; read-phase failures are never reported, and a failed 16-bit range data read surfaces as `TIMEOUT`), `rear_bus_err_site` (site of the latest BUS_ERROR: `NONE`/`TCA_SELECT`/`READY_REGISTER`/`RANGE_STATUS`/`RANGE_READ`), `rear_reinit_count` (runtime re-init attempts; always 0 in the shipped firmware, where `config.h` `REAR_TOF_RUNTIME_REINIT` is 0 because a re-init from `loop()` can stall it for seconds — boot init and `TOFTEST` are never counted), `rear_reinit_result` (latest such attempt: `NONE`/`OK`/`FAILED`); debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
+| `SYSTEM` | `proto`, `fw_build`, `fw_build_utc` (as in READY), `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, loop timing (all since boot, ms of `millis()`): `loop_max_ms` (longest single `loop()` pass, excluding its trailing 1 ms yield), `loop_max_source` (slowest section of that pass), `last_stall_ms` / `last_stall_source` / `last_stall_uptime_ms` (latest pass ≥ `LOOP_STALL_THRESHOLD_MS` = 50 ms, its slowest section, and when it ended; `0`, `"NONE"`, `0` until one happens), `stall_count` (passes ≥ 50 ms); sections: `COMM_RX` (UART reading and every command handler, diagnostics included), `REAR_TOF`, `FRONT_US`, `MOTORTEST`, `MOTOR` (watchdog, gate, motor writes), `TELEMETRY`, `GPS`, `NONE`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
 
 Debug keys are controlled by `TELEMETRY_INCLUDE_DEBUG` in `config.h`.
 
@@ -371,7 +382,7 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 |---|---|---|
 | TELEMETRY, typical | 565 | 49.0 ms (24.5 % of its 200 ms slot) |
 | TELEMETRY, worst case (every field at maximum width) | 621 | 53.9 ms (27.0 %) |
-| DIAG FRONT / REAR / SYSTEM | 391 / 730 / ~500–535 | 33.9 / 63.4 / ~46 ms |
+| DIAG FRONT / REAR / SYSTEM | 391 / 689–730 / ~680–725 (SYSTEM with the loop-timing and build-identity keys) | 33.9 / 59.8–63.4 / ~59–63 ms |
 | DIAG REAR, worst case (every field at maximum width) | 849 | 73.7 ms |
 | ACK DRIVE (−255/−255) | 195 | 16.9 ms |
 | ACK PING / STOP | 136 / 174 | 11.8 / 15.1 ms |
@@ -380,9 +391,10 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 | ACK I2CSCAN, 3 devices / 16 devices (estimate) | 679 / ~1940 | 59 / ~168 ms |
 | Command DRIVE / longest command (MOTORTEST) | 70–75 / 103 | 6.1–6.5 / 8.9 ms |
 
-Steady-state ESP32 → Pi load: fast ≈ 2825 B/s + DIAG ≈ 1365 B/s ≈ **36 %** of the link
-(measured 37–39 % including test command traffic), against ≈ **92 %** for the v1
-telemetry line.
+Steady-state ESP32 → Pi load: fast ≈ 2825 B/s + DIAG ≈ 1530 B/s ≈ **38 %** of the link
+(measured 37–39 % including test command traffic before the loop-timing and build-identity
+keys added ~200 B to each DIAG SYSTEM, one every 1.2 s, i.e. ~165 B/s), against ≈ **92 %**
+for the v1 telemetry line.
 
 **ACK latency, estimated for a physical 115200 link in normal operation** (DRIVE
 command, 70 B up and 195 B back):

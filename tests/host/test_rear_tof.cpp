@@ -14,6 +14,12 @@
 //
 //  What this CANNOT show: real ESP32 Wire / IDF error codes and timing, real
 //  VL53L0X init duration, or how the physical sensors behave after a fault.
+//
+//  Built twice by tests/run_host_tests.py: with the shipped configuration
+//  (REAR_TOF_RUNTIME_REINIT 0) and with -DREAR_TOF_RUNTIME_REINIT=1. Each test
+//  declares which build it belongs to; `test_rear_tof <prefix>` runs only the
+//  tests whose name starts with <prefix>, whatever the build (negative
+//  controls).
 // ============================================================================
 
 #include <stdio.h>
@@ -148,6 +154,7 @@ struct SimTof {
 
 static SimTof gSim[REAR_TOF_SENSOR_COUNT];
 static int    gBadSelect = 0;   // VL53L0X accessed with != 1 channel open
+static uint32_t gMaxStepMs = 0; // longest single safetyUpdate() (see step())
 
 // Timeout-flag bookkeeping across all three sensor objects.
 static int    gFlagsSet     = 0;   // flag went false -> true
@@ -291,6 +298,7 @@ static void resetSim(void)
         gSim[i].budgetCalls = 0;
     }
     rearTofSetReinitPermitted(true);
+    gMaxStepMs = 0;
 }
 
 // The rear-relevant part of setup(), in setup()'s order.
@@ -302,10 +310,18 @@ static void boot(void)
     safetyInit();
 }
 
+// One loop() pass: 1 ms, then safetyUpdate(). The clock only moves inside
+// safetyUpdate() if something in it waited -- an init() with initDelayMs
+// advances it by exactly that much -- so gMaxStepMs is how long the longest
+// single pass blocked the control loop.
 static void step(void)
 {
     gNow++;
+    uint32_t before = gNow;
     safetyUpdate();
+    if (gNow - before > gMaxStepMs) {
+        gMaxStepMs = gNow - before;
+    }
 }
 
 static void run(uint32_t ms)
@@ -960,40 +976,267 @@ static void testQ(void)
     CHECK(runUntil([] { return rearTofValid(1); }, 2000), "never recovered");
 }
 
-int main(void)
-{
-    static const struct { const char *name; TestFn fn; } kTests[] = {
-        { "A  50 consecutive BUS_ERRORs demote",          testA },
-        { "B  demotion reaches throttled re-init",        testB },
-        { "C  valid only after new valid readings",       testC },
-        { "D  TIMEOUT not counted, breaks a run",         testD },
-        { "E  OUT_OF_RANGE not counted, breaks a run",    testE },
-        { "F  recovery keeps the obstacle latch",         testF },
-        { "G  demotion clears the sample window",         testG },
-        { "H  no retry storm",                            testH },
-        { "I  CRITICAL: all demoted, reverse blocked",    testI },
-        { "J  boot policy unchanged",                     testJ },
-        { "K  TCA select failures not counted",           testK },
-        { "L  diagnostics: site + raw code",              testL },
-        { "M  stale timeout flag cleared before read",    testM },
-        { "N  hung init fails: one attempt, safe fault",  testN },
-        { "O  hung init 'succeeds': rejected",            testO },
-        { "P  refused timing budget: safe fault",         testP },
-        { "Q  re-init only while permitted",              testQ },
-    };
+// ===========================================================================
+// RX-01 -- runtime re-init OFF (the shipped configuration). A failed rear
+// sensor's init() must never run from loop(), however long it would take.
+// Each of these fails with -DREAR_TOF_RUNTIME_REINIT=1: the 5 s init() then
+// shows up as a 5000 ms pass in gMaxStepMs.
+// ===========================================================================
 
-    int failedTests = 0;
+#define SLOW_INIT_MS 5000       // one hung init(), as long as the 2026-10-02 hang or longer
+
+// Over `ms` of loop passes: did anything block, did reverse ever open while a
+// rear sensor was invalid, and how many init() calls reached sensor `idx`?
+static void runStationary(uint32_t ms, int idx, int *initCallsOut, int *unguardedOut)
+{
+    const int before = gSim[idx].initCalls;
+    int unguarded = 0;
+    rearTofSetReinitPermitted(true);            // wheels stopped: the old trigger
+    for (uint32_t i = 0; i < ms; i++) {
+        step();
+        if (!allValid() && !safetyReverseBlocked()) unguarded++;
+    }
+    *initCallsOut = gSim[idx].initCalls - before;
+    *unguardedOut = unguarded;
+}
+
+// ---------------------------------------------------------------------------
+// R. Boot-failed sensor whose init() would now hang 5 s: the loop never waits
+// ---------------------------------------------------------------------------
+static void testR(void)
+{
+    resetSim();
+    gSim[1].initOk = false;                     // dead at boot (fast failure)
+    boot();
+    CHECK(!rearTofInitialised(1), "setup: sensor 1 initialised");
+    run(1500);
+    CHECK(rearTofValid(0) && rearTofValid(2), "setup: healthy sensors not valid");
+
+    gSim[1].initDelayMs = SLOW_INIT_MS;         // any further init() hangs 5 s
+    gMaxStepMs = 0;
+    int calls = 0, unguarded = 0;
+    runStationary(60000, 1, &calls, &unguarded);
+
+    CHECK(gMaxStepMs == 0, "a loop pass blocked: init() ran from safetyUpdate()");
+    CHECK(calls == 0, "runtime init() reached the failed sensor");
+    CHECK(rearTofReinitCount(1) == 0, "runtime re-init counted");
+    CHECK(unguarded == 0, "reverse open while the rear sensor was failed");
+    CHECK(rearTofStatusOf(1) == TOF_INIT_FAILED, "failure status lost");
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors disturbed");
+    CHECK(safetyRearSensorFault(), "rear fault not reported");
+    CHECK(strcmp(safetyBlockReason(-100, -100), "REAR_SENSOR_FAULT") == 0, "block reason");
+    int l = 1, r = 1;
+    safetyGateMotion(-100, -100, &l, &r);
+    CHECK(l == 0 && r == 0, "reverse not gated");
+    safetyGateMotion(100, 100, &l, &r);
+    CHECK(l == 100 && r == 100, "forward gated by the rear fault");
+}
+
+// ---------------------------------------------------------------------------
+// S. Sensor demoted at runtime (BUS_ERRORs), init() would hang 5 s: no wait,
+//    no more polling of it, reverse stays blocked
+// ---------------------------------------------------------------------------
+static void testS(void)
+{
+    bootAllValid();
+    gSim[1].mode        = M_ERR_READY;
+    gSim[1].initOk      = false;
+    gSim[1].initDelayMs = SLOW_INIT_MS;
+    CHECK(runUntil([] { return !rearTofInitialised(1); }, 20000), "never demoted");
+    const uint32_t errsAtDemotion = rearTofBusErrTotal(1);
+
+    gMaxStepMs = 0;
+    int calls = 0, unguarded = 0;
+    runStationary(60000, 1, &calls, &unguarded);
+
+    CHECK(gMaxStepMs == 0, "a loop pass blocked after demotion");
+    CHECK(calls == 0, "runtime init() reached the demoted sensor");
+    CHECK(rearTofReinitCount(1) == 0, "runtime re-init counted");
+    CHECK(rearTofBusErrTotal(1) == errsAtDemotion, "demoted sensor still being polled");
+    CHECK(rearTofStatusOf(1) == TOF_BUS_ERROR, "failure status lost");
+    CHECK(unguarded == 0, "reverse open while the rear sensor was failed");
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors disturbed");
+    CHECK(safetyReverseBlocked(), "reverse not blocked");
+}
+
+// ---------------------------------------------------------------------------
+// T. All three demoted: backend stays up, reverse stays blocked, nothing waits
+// ---------------------------------------------------------------------------
+static void testT(void)
+{
+    bootAllValid();
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        gSim[i].initOk      = false;
+        gSim[i].initDelayMs = SLOW_INIT_MS;
+        gSim[i].mode        = M_ERR_READY;
+    }
+    gMaxStepMs = 0;
+    int unavailable = 0, unguarded = 0;
+    for (int ms = 0; ms < 60000; ms++) {
+        step();
+        if (!rearTofBackendAvailable() || !safetyRearSensingAvailable()) unavailable++;
+        if (!allValid() && !safetyReverseBlocked()) unguarded++;
+    }
+    CHECK(gMaxStepMs == 0, "a loop pass blocked");
+    CHECK(unavailable == 0, "rear backend became unavailable at runtime");
+    CHECK(unguarded == 0, "reverse open while a rear sensor was invalid");
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        CHECK(!rearTofInitialised(i), "sensor not demoted");
+        CHECK(gSim[i].initCalls == 1, "runtime init() called");
+        CHECK(rearTofReinitCount(i) == 0, "runtime re-init counted");
+    }
+    CHECK(safetyRearSensorFault(), "rear sensor fault not reported");
+    CHECK(strcmp(safetyBlockReason(-100, -100), "REAR_SENSOR_FAULT") == 0, "block reason");
+}
+
+// ---------------------------------------------------------------------------
+// U. Boot policy: nothing came up at boot -> it never comes up later, and the
+//    configured unconfigured-rear policy applies unchanged (see RX-05)
+// ---------------------------------------------------------------------------
+static void testU(void)
+{
+    resetSim();
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) gSim[i].initOk = false;
+    boot();
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        gSim[i].initOk      = true;             // would now succeed...
+        gSim[i].initDelayMs = SLOW_INIT_MS;     // ...after a 5 s hang
+    }
+    const bool policy = (SAFETY_BLOCK_REVERSE_WHEN_REAR_UNCONFIGURED != 0);
+
+    gMaxStepMs = 0;
+    int cameUp = 0, policyChanged = 0;
+    for (int ms = 0; ms < 30000; ms++) {
+        step();
+        if (rearTofBackendAvailable()) cameUp++;
+        if (safetyReverseBlocked() != policy) policyChanged++;
+    }
+    CHECK(gMaxStepMs == 0, "a loop pass blocked");
+    CHECK(cameUp == 0, "backend came up without a boot init");
+    CHECK(policyChanged == 0, "unconfigured-rear reverse policy changed");
+    CHECK(!safetyRearSensorFault(), "boot all-fail reported as a sensor fault");
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        CHECK(gSim[i].initCalls == REAR_TOF_INIT_ATTEMPTS, "runtime init() called");
+        CHECK(rearTofStatusOf(i) == TOF_INIT_FAILED, "status");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V. Demotion keeps the obstacle latch and clears the sample window
+// ---------------------------------------------------------------------------
+static void testV(void)
+{
+    resetSim();
+    gSim[1].mm = 100;                           // inside REAR_STOP_DISTANCE_MM
+    boot();
+    run(1500);
+    CHECK(safetyRearSensorObstacle(1), "setup: latch not set");
+    CHECK(rearTofGoodSampleCount(1) == REAR_TOF_SAMPLE_WINDOW, "setup: window");
+
+    gSim[1].mode = M_ERR_READY;
+    int latchLost = 0;
+    while (rearTofInitialised(1) && gNow < 30000) {
+        step();
+        if (!safetyRearSensorObstacle(1)) latchLost++;
+    }
+    CHECK(!rearTofInitialised(1), "never demoted");
+    CHECK(rearTofGoodSampleCount(1) == 0, "window not cleared");
+    CHECK(rearTofFilteredMm(1) == REAR_TOF_INVALID_MM, "filtered value kept");
+
+    gSim[1].mode = M_VALID;                     // sensor would answer again...
+    gSim[1].mm   = 1000;                        // ...far away
+    for (int ms = 0; ms < 30000; ms++) {
+        step();
+        if (!safetyRearSensorObstacle(1)) latchLost++;
+    }
+    CHECK(latchLost == 0, "latch cleared by demotion or invalid data");
+    CHECK(!rearTofValid(1), "demoted sensor became valid without a boot");
+    CHECK(safetyReverseBlocked(), "reverse open");
+}
+
+// ---------------------------------------------------------------------------
+// W. Hung BOOT init (the 2026-10-02 case): one slow attempt at boot, and never
+//    retried from the loop, whether init() reported failure or success
+// ---------------------------------------------------------------------------
+static void hungBootCase(bool initOk)
+{
+    resetSim();
+    gSim[1].initOk      = initOk;
+    gSim[1].initDelayMs = 1000;
+    boot();
+    CHECK(gSim[1].initCalls == 1, "slow boot attempt was retried at once");
+    CHECK(!rearTofInitialised(1), "slow init accepted");
+    CHECK(rearTofStatusOf(1) == TOF_INIT_FAILED, "status");
+
+    gSim[1].initDelayMs = SLOW_INIT_MS;
+    gMaxStepMs = 0;
+    int calls = 0, unguarded = 0;
+    runStationary(60000, 1, &calls, &unguarded);
+    CHECK(gMaxStepMs == 0, "a loop pass blocked");
+    CHECK(calls == 0, "runtime init() retried the hung sensor");
+    CHECK(unguarded == 0, "reverse open with an untrusted sensor");
+    CHECK(rearTofValid(0) && rearTofValid(2), "healthy sensors not valid");
+}
+
+static void testW(void)
+{
+    hungBootCase(false);
+    hungBootCase(true);
+}
+
+enum Build { BOTH, REINIT_OFF, REINIT_ON };
+
+int main(int argc, char **argv)
+{
+    static const struct { const char *name; TestFn fn; Build build; } kTests[] = {
+        { "A  50 consecutive BUS_ERRORs demote",          testA, BOTH },
+        { "B  demotion reaches throttled re-init",        testB, REINIT_ON },
+        { "C  valid only after new valid readings",       testC, REINIT_ON },
+        { "D  TIMEOUT not counted, breaks a run",         testD, BOTH },
+        { "E  OUT_OF_RANGE not counted, breaks a run",    testE, BOTH },
+        { "F  recovery keeps the obstacle latch",         testF, REINIT_ON },
+        { "G  demotion clears the sample window",         testG, REINIT_ON },
+        { "H  no retry storm",                            testH, REINIT_ON },
+        { "I  CRITICAL: all demoted, reverse blocked",    testI, REINIT_ON },
+        { "J  boot policy unchanged",                     testJ, REINIT_ON },
+        { "K  TCA select failures not counted",           testK, BOTH },
+        { "L  diagnostics: site + raw code",              testL, BOTH },
+        { "M  stale timeout flag cleared before read",    testM, REINIT_ON },
+        { "N  hung init fails: one attempt, safe fault",  testN, REINIT_ON },
+        { "O  hung init 'succeeds': rejected",            testO, REINIT_ON },
+        { "P  refused timing budget: safe fault",         testP, BOTH },
+        { "Q  re-init only while permitted",              testQ, REINIT_ON },
+        { "R  RX-01: boot-failed, 5 s init never runs",   testR, REINIT_OFF },
+        { "S  RX-01: demoted, 5 s init never runs",       testS, REINIT_OFF },
+        { "T  RX-01: all demoted, reverse blocked",       testT, REINIT_OFF },
+        { "U  RX-01: boot all-fail policy unchanged",     testU, REINIT_OFF },
+        { "V  RX-01: demotion keeps latch, clears window", testV, REINIT_OFF },
+        { "W  RX-01: hung boot init never retried",       testW, REINIT_OFF },
+    };
+    const Build thisBuild = REAR_TOF_RUNTIME_REINIT ? REINIT_ON : REINIT_OFF;
+    const char *only = (argc > 1) ? argv[1] : NULL;
+
+    printf("=== rear ToF build: REAR_TOF_RUNTIME_REINIT=%d%s%s ===\n",
+           (int)REAR_TOF_RUNTIME_REINIT, only ? ", only " : "", only ? only : "");
+
+    int ran = 0, failedTests = 0;
     for (size_t t = 0; t < sizeof(kTests) / sizeof(kTests[0]); t++) {
+        if (only != NULL) {
+            if (strncmp(kTests[t].name, only, strlen(only)) != 0) continue;
+        } else if (kTests[t].build != BOTH && kTests[t].build != thisBuild) {
+            continue;
+        }
         gTest = kTests[t].name;
         int before = gFails;
         kTests[t].fn();
         CHECK(gBadSelect == 0, "VL53L0X accessed without exactly its channel open");
         bool ok = (gFails == before);
         if (!ok) failedTests++;
+        ran++;
         printf("  %s  %s\n", ok ? "PASS" : "FAIL", kTests[t].name);
     }
 
     printf("=== rear ToF recovery: %d tests, %d failed, %d checks, %d check failures ===\n",
-           (int)(sizeof(kTests) / sizeof(kTests[0])), failedTests, gChecks, gFails);
-    return (gFails == 0) ? 0 : 1;
+           ran, failedTests, gChecks, gFails);
+    return (gFails == 0 && ran > 0) ? 0 : 1;
 }

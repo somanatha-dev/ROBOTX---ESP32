@@ -77,9 +77,10 @@ const char *motorDriveStatusName(void);
 void driveDifferential(int leftSpeed, int rightSpeed);
 
 // ---------------------------------------------------------------------------
-// Immediate stop of all four channels: enables to zero FIRST, then direction
-// pins low. Works even when the PCA9685 is unavailable -- the direction pins
-// are still driven low, which is all this firmware can do in that case.
+// Immediate stop of all four channels: all eight direction pins LOW FIRST
+// (GPIO, cannot be held up by the I2C bus), THEN the PCA9685 enables to zero.
+// Works even when the PCA9685 is unavailable -- the direction pins are still
+// driven low, which is all this firmware can do in that case.
 // ---------------------------------------------------------------------------
 void stopMotors(void);
 

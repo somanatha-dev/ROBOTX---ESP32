@@ -883,6 +883,149 @@ def t26_gated_mixed_no_output(ctx):
         set_front(150)
 
 
+def t27_rear_init_stall(ctx):
+    # RX-01. A rear VL53L0X whose init() blocks for SIM_REAR_INIT_DELAY_MS (5 s)
+    # must not stall loop(): while it stays failed, commands are still ACKed,
+    # TELEMETRY keeps its 200 ms cadence, the watchdog still fires, and reverse
+    # stays blocked. Needs SIM_REAR_TOF=1 (a mux at the configured address with
+    # three sensors, the one on SIM_REAR_BAD_CH faulty). With the old runtime
+    # re-init (config.h REAR_TOF_RUNTIME_REINIT 1) the sensor is retried every
+    # 5 s while the wheels are stopped, every retry stalls the whole loop for the
+    # init() time, and the TELEMETRY gap check below fails first.
+    if ctx.physical or ctx.sim_env.get("SIM_REAR_TOF") != "1":
+        raise Skip("needs the simulator with SIM_REAR_TOF=1")
+    if ctx.sim_env.get("SIM_REAR_BAD_CH", "1") == "-1":
+        raise Skip("needs a faulty rear sensor (SIM_REAR_BAD_CH)")
+    if not ctx.last_tel["motor_drive_available"]:
+        raise Skip("needs SIM_DRIVE_AVAILABLE=1")
+    delay_s =int(ctx.sim_env.get("SIM_REAR_INIT_DELAY_MS", "5000")) / 1000.0
+    window_s = max(15.0, 3 * delay_s + 3.0)     # >= 3 of the old 5 s re-init periods
+
+    rec = ctx.link.wait(lambda f: f["type"] == "TELEMETRY" and f.get("rear_available") is True
+                        and f.get("rear_sensor_fault") is True and f["front_valid"]
+                        and not f["forward_blocked"], ctx.link.mark(), 3.0)
+    check(rec is not None, "never saw rear sensing up with one failed sensor and a clear front")
+    check(rec.frame["reverse_blocked"] is True, f"reverse not blocked with a failed rear sensor: {rec.frame}")
+
+    # Reverse stays gated by the failed sensor; forward is unaffected by it.
+    f = ack(ctx.cmd("DRIVE", left=-120, right=-120), result="GATED", reason="REAR_SENSOR_FAULT")
+    check((f["applied_left"], f["applied_right"]) == (0, 0), f"reverse applied power: {f}")
+    ack(ctx.cmd("RESET"), result="ACCEPTED")
+    f = ack(ctx.cmd("DRIVE", left=120, right=120), result="ACCEPTED", reason="NONE")
+    check((f["applied_left"], f["applied_right"]) == (120, 120), f"forward not applied: {f}")
+    ctx.stop()
+
+    # Pi-like traffic with the wheels stopped -- the condition that used to
+    # trigger the re-init: one STOP every 100 ms for window_s.
+    start = ctx.link.mark()
+    t0 = time.monotonic()
+    worst_ack, missing, sent, t_last = 0.0, 0, 0, t0
+    while time.monotonic() - t0 < window_s:
+        tick = time.monotonic()
+        s = ctx.next_seq()
+        m = ctx.link.mark()
+        t_last = ctx.link.send(command(s, "STOP"))
+        sent += 1
+        r = ctx.link.response(s, m, timeout=0.45)
+        if r is None:
+            missing += 1
+        else:
+            worst_ack = max(worst_ack, r.t - t_last)
+        time.sleep(max(0.0, 0.1 - (time.monotonic() - tick)))
+    end = ctx.link.mark()
+
+    fast = ctx.link.frames(start, end, "TELEMETRY")
+    check(len(fast) >= 2, f"only {len(fast)} TELEMETRY frames in {window_s:.0f} s")
+    gaps = [b.t - a.t for a, b in zip(fast, fast[1:])]
+    max_gap = max(gaps)
+    check(max_gap <= 0.4, f"TELEMETRY gap of {max_gap:.2f}s: the control loop stalled")
+    check(len(fast) >= window_s / 0.2 * 0.9, f"only {len(fast)} TELEMETRY frames in {window_s:.0f} s")
+    check(missing == 0, f"{missing} of {sent} STOPs got no ACK within 0.45 s")
+    check(worst_ack <= 0.25, f"slowest STOP ACK {worst_ack * 1000:.0f} ms")
+    timeouts = [r for r in ctx.link.frames(start, end, "EVENT") if r.frame.get("event") == "COMMAND_TIMEOUT"]
+    check(not timeouts, "COMMAND_TIMEOUT while STOPs were arriving every 100 ms: "
+                        f"{[r.frame for r in timeouts[:1]]}")
+    last = fast[-1].frame
+    check(last["reverse_blocked"] is True and last["rear_sensor_fault"] is True,
+          f"failed rear sensor no longer blocks reverse: {last}")
+
+    # Loop-timing evidence in DIAG SYSTEM.
+    d = ctx.diag("SYSTEM", timeout=2.5)
+    for key, kind in (("loop_max_ms", int), ("loop_max_source", str), ("last_stall_ms", int),
+                      ("last_stall_source", str), ("last_stall_uptime_ms", int), ("stall_count", int)):
+        check(isinstance(d.get(key), kind) and not isinstance(d.get(key), bool),
+              f"DIAG SYSTEM {key} missing or not {kind.__name__}: {d.get(key)!r}")
+    check(d["loop_max_ms"] < 1000 * delay_s, f"loop_max_ms {d['loop_max_ms']}: a pass waited on the slow init")
+    check(d["loop_max_ms"] < 1000, f"loop_max_ms {d['loop_max_ms']} ({d['loop_max_source']})")
+
+    # The watchdog is still enforced: stop talking, it fires at ~2.0 s.
+    ev = ctx.link.wait(lambda f: f["type"] == "EVENT" and f.get("event") == "COMMAND_TIMEOUT", end, 3.0)
+    check(ev is not None, "no COMMAND_TIMEOUT after the STOPs ended")
+    dt = ev.t - t_last
+    check(1.9 <= dt <= 2.35, f"COMMAND_TIMEOUT after {dt:.3f}s, expected ~2.0s")
+
+    ctx.stats.update({
+        "rear_stall_window_s": round(window_s, 1),
+        "rear_stall_telemetry_max_gap_ms": round(max_gap * 1000, 1),
+        "rear_stall_worst_stop_ack_ms": round(worst_ack * 1000, 1),
+        "diag_loop_max_ms": d["loop_max_ms"],
+        "diag_loop_max_source": d["loop_max_source"],
+        "diag_stall_count": d["stall_count"],
+        "diag_last_stall": f'{d["last_stall_ms"]} ms {d["last_stall_source"]}',
+        "rear_stall_watchdog_after_s": round(dt, 3),
+    })
+    ctx.stop()
+
+
+def t28_toftest_refused_under_control(ctx):
+    # P2: TOFTEST stalls loop() (single-shot reads, and init() on a sensor that
+    # is not initialised -- 5 s for the simulated faulty ch1). Under live
+    # control it must be refused at once, with the cadence untouched.
+    if ctx.physical or ctx.sim_env.get("SIM_REAR_TOF") != "1":
+        raise Skip("needs the simulator with SIM_REAR_TOF=1")
+
+    def stream(seconds):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < seconds:
+            ack(ctx.cmd("STOP"), result="ACCEPTED")
+            time.sleep(0.1)
+
+    stream(0.5)
+    start = ctx.link.mark()
+    s = ctx.next_seq()
+    m = ctx.link.mark()
+    t = ctx.link.send(command(s, "TOFTEST"))
+    rec = ctx.link.response(s, m, timeout=1.0)
+    check(rec is not None, "no answer to TOFTEST")
+    ack(rec.frame, cmd="TOFTEST", result="REJECTED", reason="REFUSED_MOTION_CONTROL_ACTIVE")
+    check(rec.t - t <= 0.3, f"TOFTEST answer took {(rec.t - t) * 1000:.0f} ms")
+    stream(1.5)
+    fast = ctx.link.frames(start, ctx.link.mark(), "TELEMETRY")
+    gaps = [b.t - a.t for a, b in zip(fast, fast[1:])]
+    check(gaps and max(gaps) <= 0.4, f"TELEMETRY gap {max(gaps or [0]):.2f}s around a refused TOFTEST")
+    ctx.stats["toftest_refusal_ms"] = round((rec.t - t) * 1000, 1)
+
+
+def t29_build_identity(ctx):
+    # P2 / RX-15: READY and DIAG SYSTEM carry the build identity the build
+    # stamped (tools/gen_fw_build_id.py or -DFW_BUILD_ID), never a constant.
+    ready = next((r.frame for r in ctx.link.items
+                  if r.frame and r.frame.get("type") == "EVENT" and r.frame.get("event") == "READY"), None)
+    if ready is None:
+        raise Skip("READY was not captured")
+    d = ctx.diag("SYSTEM", timeout=2.5)
+    for src, f in (("READY", ready), ("DIAG SYSTEM", d)):
+        check(isinstance(f.get("fw_build"), str) and f["fw_build"], f"{src} fw_build missing: {f.get('fw_build')!r}")
+        check(isinstance(f.get("fw_build_utc"), str) and f["fw_build_utc"],
+              f"{src} fw_build_utc missing: {f.get('fw_build_utc')!r}")
+    check(ready["fw_build"] == d["fw_build"], f"READY {ready['fw_build']!r} != DIAG {d['fw_build']!r}")
+    check(ready["fw"] == "rover-esp32", f"READY fw changed: {ready['fw']!r}")
+    if ctx.expect_fw_build is not None:
+        check(ready["fw_build"] == ctx.expect_fw_build,
+              f"fw_build {ready['fw_build']!r}, the build stamped {ctx.expect_fw_build!r}")
+    ctx.stats["fw_build"] = f'{ready["fw_build"]} @ {ready["fw_build_utc"]}'
+
+
 TESTS = [
     ("01 valid DRIVE", t01_valid_drive),
     ("02 valid STOP", t02_stop),
@@ -910,6 +1053,9 @@ TESTS = [
     ("24 diagnostics", t24_diagnostics),
     ("25 obstacle: no auto-resume", t25_obstacle_no_auto_resume),
     ("26 gated mixed: no output", t26_gated_mixed_no_output),
+    ("27 rear init stall: loop runs", t27_rear_init_stall),
+    ("28 TOFTEST refused in control", t28_toftest_refused_under_control),
+    ("29 build identity", t29_build_identity),
 ]
 
 
@@ -922,6 +1068,7 @@ def main():
     ap.add_argument("--allow-motion", action="store_true",
                     help="run even if motor_drive_available is true (ROVER ON BLOCKS)")
     ap.add_argument("--only", help="comma-separated test number prefixes, e.g. 01,17")
+    ap.add_argument("--expect-fw-build", help="fw_build the firmware under test must report (test 29)")
     args = ap.parse_args()
 
     if args.sim:
@@ -935,6 +1082,8 @@ def main():
     ctx = Ctx(link, physical=bool(args.port))
     ctx.front_file = env.get("SIM_FRONT_CM_FILE") if args.sim else None
     ctx.pca_log = env.get("SIM_PCA_LOG_FILE") if args.sim else None
+    ctx.sim_env = env if args.sim else {}
+    ctx.expect_fw_build = args.expect_fw_build
 
     try:
         # Let boot output settle and front sensors fill their windows.

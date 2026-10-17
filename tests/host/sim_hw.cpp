@@ -24,6 +24,18 @@
 //    SIM_PCA_LOG_FILE     optional file; every non-zero PCA9685 duty write is
 //                         appended to it (motor output, for no-output proofs)
 //    SIM_ROM_NOISE        1 = print ESP32-boot-ROM-style text before setup()
+//    SIM_REAR_TOF         1 = a TCA9548A answers at the CONFIGURED address
+//                         (config.h TCA9548A_I2C_ADDRESS) with three VL53L0X
+//                         behind it, so rear_tof.cpp really runs. Default 0:
+//                         no mux there, the rear backend never comes up (as
+//                         every run before this option).
+//    SIM_REAR_BAD_CH      TCA channel of the one faulty sensor (default 1, the
+//                         rover's rear-left; -1 = all healthy). Its init()
+//                         fails at boot at once; every init() AFTER setup()
+//                         blocks for SIM_REAR_INIT_DELAY_MS of wall-clock time
+//                         and then fails -- the 2026-10-02 hung-init pattern.
+//    SIM_REAR_INIT_DELAY_MS  default 5000
+//    SIM_REAR_MM          range the healthy sensors report (default 1000)
 // ============================================================================
 
 #include <windows.h>
@@ -36,7 +48,9 @@
 
 #include "Arduino.h"
 #include "Wire.h"
+#include "VL53L0X.h"
 #include "pca9685.h"
+#include "config.h"
 
 void setup(void);
 void loop(void);
@@ -169,9 +183,21 @@ static uint8_t gRxByte     = 0;
 static uint8_t gLastWrite  = 0;
 static bool    gWroteByte  = false;
 
+// SIM_REAR_TOF. See the header for the model.
+static bool     gRearSim         = false;
+static int      gRearBadCh       = TCA_CH_REAR_TOF_1;
+static uint32_t gRearInitDelayMs = 5000;
+static uint16_t gRearMm          = 1000;
+static bool     gSetupDone       = false;
+
+static bool isTca(int addr)
+{
+    return addr == 0x70 || (gRearSim && addr == TCA9548A_I2C_ADDRESS);
+}
+
 static bool devicePresent(int addr)
 {
-    return addr == 0x40 || addr == 0x42 || addr == 0x70;
+    return addr == 0x40 || addr == 0x42 || isTca(addr);
 }
 
 bool TwoWire::begin(int sda, int scl, uint32_t freq)
@@ -199,7 +225,7 @@ uint8_t TwoWire::endTransmission(bool sendStop)
     if (!devicePresent(gTxAddr)) {
         return 2;                                   // address NACK
     }
-    if (gTxAddr == 0x70 && gWroteByte) {
+    if (isTca(gTxAddr) && gWroteByte) {
         gTcaMask = gLastWrite;                      // TCA9548A control register
     }
     return 0;
@@ -211,9 +237,76 @@ uint8_t TwoWire::requestFrom(int address, int quantity)
         gRxAvail = 0;
         return 0;
     }
-    gRxByte  = (address == 0x70) ? gTcaMask : 0x00;
+    gRxByte  = isTca(address) ? gTcaMask : 0x00;
     gRxAvail = 1;
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// VL53L0X behind the TCA9548A (SIM_REAR_TOF). Answered by the sensor on the
+// ONE channel open right now; with none (or several) open nothing answers.
+// ---------------------------------------------------------------------------
+
+static int openRearChannel(void)
+{
+    uint8_t m = gTcaMask;
+    if (m == 0 || (m & (m - 1)) != 0) {
+        return -1;
+    }
+    int ch = 0;
+    while (!(m & 1u)) {
+        m >>= 1;
+        ch++;
+    }
+    return ch;
+}
+
+bool simVl53Init(void)
+{
+    int ch = openRearChannel();
+    if (!gRearSim || ch < 0) {
+        return false;
+    }
+    if (ch == gRearBadCh) {
+        if (gSetupDone && gRearInitDelayMs > 0) {
+            Sleep(gRearInitDelayMs);                // the whole loop stalls here
+        }
+        return false;
+    }
+    return true;
+}
+
+uint8_t simVl53ReadReg(uint8_t reg, uint8_t *status)
+{
+    int ch = openRearChannel();
+    if (!gRearSim) {
+        *status = 0;
+        return 0;
+    }
+    if (ch < 0 || ch == gRearBadCh) {
+        *status = 2;                                // address NACK
+        return 0xFF;
+    }
+    *status = 0;
+    if (reg == VL53L0X::RESULT_INTERRUPT_STATUS) return 0x07;   // ready
+    if (reg == VL53L0X::RESULT_RANGE_STATUS)     return (uint8_t)(11 << 3);
+    return 0;
+}
+
+uint16_t simVl53ReadRange(uint8_t *status, bool *timedOut)
+{
+    int ch = openRearChannel();
+    if (!gRearSim) {
+        *status   = 0;
+        *timedOut = true;
+        return 65535;
+    }
+    if (ch < 0 || ch == gRearBadCh) {
+        *status = 2;
+        return 0xFFFF;
+    }
+    *status = 0;
+    return gRearMm;
 }
 
 int TwoWire::available(void) { return gRxAvail; }
@@ -282,6 +375,10 @@ int main(void)
     if ((e = getenv("SIM_FRONT_CM"))        != NULL) gFrontCm        = atof(e);
     if ((e = getenv("SIM_FRONT_CM_FILE"))   != NULL) gFrontFile      = e;
     if ((e = getenv("SIM_PCA_LOG_FILE"))    != NULL) gPcaLogFile     = e;
+    if ((e = getenv("SIM_REAR_TOF"))        != NULL) gRearSim        = (atoi(e) != 0);
+    if ((e = getenv("SIM_REAR_BAD_CH"))     != NULL) gRearBadCh      = atoi(e);
+    if ((e = getenv("SIM_REAR_INIT_DELAY_MS")) != NULL) gRearInitDelayMs = (uint32_t)atol(e);
+    if ((e = getenv("SIM_REAR_MM"))         != NULL) gRearMm         = (uint16_t)atoi(e);
 
     if ((e = getenv("SIM_ROM_NOISE")) != NULL && atoi(e) != 0) {
         static const char kRom[] =
@@ -295,6 +392,7 @@ int main(void)
     }
 
     setup();
+    gSetupDone = true;
     for (;;) {
         loop();
     }

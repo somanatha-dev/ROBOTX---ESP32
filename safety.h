@@ -47,6 +47,11 @@ void safetyInit(void);
 // ---------------------------------------------------------------------------
 void safetyUpdate(void);
 
+// How long the REAR half (rearTofUpdate + latch) of the latest safetyUpdate()
+// call took, in ms. Lets loop() tell a rear ToF stall from a front ping in
+// the DIAG SYSTEM stall record.
+uint32_t safetyLastRearUpdateMs(void);
+
 // ---------------------------------------------------------------------------
 // FRONT per-sensor readings. sensorIndex is US_FRONT_LEFT or US_FRONT_RIGHT.
 // ---------------------------------------------------------------------------

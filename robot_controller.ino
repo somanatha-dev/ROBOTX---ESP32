@@ -188,8 +188,13 @@ void loop()
     // 1. COMMANDS (pre-sensor)
     //    Drain the UART before the sensor tick, which can block for up to
     //    one pulseIn timeout (~20 ms).
+    //
+    //    commLoop*() time each section of this pass for DIAG SYSTEM
+    //    (loop_max_ms, last_stall_*). Arithmetic only; nothing waits.
     // ------------------------------------------------------------------
+    commLoopBegin();
     commPoll();
+    commLoopMark("COMM_RX");
 
     // ------------------------------------------------------------------
     // 2. SENSORS
@@ -203,14 +208,19 @@ void loop()
     //    so this never waits for a measurement. It is a no-op while the
     //    TCA9548A address is unconfirmed.
     //
-    //    A failed rear sensor's re-init can block for seconds inside the
-    //    VL53L0X library, so it is only permitted while no wheel is driven:
-    //    any such block then happens with every motor enable at zero.
+    //    A failed rear sensor is NOT re-initialised from here (RX-01): the
+    //    VL53L0X library's init() can block for seconds and nothing can cut
+    //    it short, so with config.h REAR_TOF_RUNTIME_REINIT 0 a failed sensor
+    //    stays failed (reverse blocked) until the next boot. The permission
+    //    below matters only if that switch is 1: the re-init is then allowed
+    //    only while no wheel is driven.
     // ------------------------------------------------------------------
     rearTofSetReinitPermitted(commAppliedLeft() == 0 &&
                               commAppliedRight() == 0 &&
                               !commTestModeActive());
     safetyUpdate();
+    commLoopNested("REAR_TOF", safetyLastRearUpdateMs());
+    commLoopMark("FRONT_US");
 
     // ------------------------------------------------------------------
     // 3. COMMANDS (post-sensor)
@@ -218,6 +228,7 @@ void loop()
     //    256-byte UART FIFO from overrunning at 115200 baud.
     // ------------------------------------------------------------------
     commPoll();
+    commLoopMark("COMM_RX");
 
     // ------------------------------------------------------------------
     // 4. COMMISSIONING OVERRIDE
@@ -226,8 +237,11 @@ void loop()
     // ------------------------------------------------------------------
     if (commTestModeActive()) {
         motorDriveChannel(commTestChannel(), commTestSpeed());
+        commLoopMark("MOTORTEST");
 
         commServiceTelemetry();
+        commLoopMark("TELEMETRY");
+        commLoopEnd();
         delay(1);
         return;
     }
@@ -304,11 +318,13 @@ void loop()
     // after the obstacle has gone. The sticky record lives in the separate
     // "safety_stop" flag.
     commUpdateRuntime(appLeft, appRight, blockReason);
+    commLoopMark("MOTOR");
 
     // ------------------------------------------------------------------
     // 7. TELEMETRY  (fast TELEMETRY frame + rotating DIAG sections)
     // ------------------------------------------------------------------
     commServiceTelemetry();
+    commLoopMark("TELEMETRY");
 
     // ------------------------------------------------------------------
     // 8. GPS  (reporting only -- nothing above reads it)
@@ -318,6 +334,8 @@ void loop()
     //    Deliberately NOT in the MOTORTEST branch above.
     // ------------------------------------------------------------------
     gpsUpdate();
+    commLoopMark("GPS");
+    commLoopEnd();
 
     // ------------------------------------------------------------------
     // 9. YIELD

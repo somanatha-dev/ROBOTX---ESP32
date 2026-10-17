@@ -101,45 +101,101 @@ static uint16_t speedToDuty12(int magnitude)
 // ONE CHANNEL
 // ============================================================================
 //
-// SEQUENCE MATTERS, and it is the same every time:
+// STOPPING IS GPIO FIRST (RX-02). The direction inputs are plain ESP32 GPIO
+// and are written instantly; the enable is a PCA9685 PWM output reached over
+// I2C, and one hung I2C transaction can take >= 1 s on this core (config.h
+// I2C_TIMEOUT_MS). So whenever a channel is to stop -- or to reverse -- both of
+// its direction inputs are driven LOW BEFORE any I2C write is attempted.
 //
-//   1. ENABLE TO ZERO FIRST. The half-bridge is switched off before its
-//      direction inputs change. Flipping direction on a LIVE bridge is how you
+// L298N truth table (datasheet): IN1 == IN2 with the enable HIGH is "fast
+// motor stop" (the bridge brakes the motor); with the enable LOW the motor
+// free-runs. So between the GPIO cutoff and the enable write the motor brakes
+// -- normally for well under a millisecond, and for as long as the I2C write
+// takes if the bus is hung, which is exactly when stopping must not wait on
+// it. Once the enable reaches 0 the channel coasts, the same end state as
+// before. Direction is never changed on a live bridge: IN1/IN2 only ever go
+// (H,L) or (L,H) -> (L,L), never straight to the opposite pair.
+//
+// DRIVING keeps the original order for a channel already turning that way:
+//
+//   1. ENABLE TO ZERO FIRST. Flipping direction on a LIVE bridge is how you
 //      get a current reversal straight through a spinning motor -- hard on the
 //      L298N, hard on the gearbox, and a supply-rail dip that can brown out
 //      the ESP32 mid-safety-check.
 //   2. SET DIRECTION. Plain digitalWrite. These pins are never PWM'd.
 //   3. RAISE THE ENABLE to the commanded duty.
 //
-// For a stop, step 3 simply writes zero and both direction pins go low, which
-// leaves the bridge coasting rather than braking -- same behaviour the
-// previous firmware had.
-//
-// If the PCA9685 is not available this still drives the direction pins low and
-// returns without pretending anything moved.
+// If step 1 fails, the enable may still be live: the channel is held stopped
+// (direction LOW) for this call instead of being given a direction. A failed
+// PCA9685 write also latches BUS_ERROR in pca9685.cpp, so motorDriveAvailable()
+// is false from then on and every later call goes through stopMotors().
 // ============================================================================
+
+// The direction each channel's inputs were last set to: +1, -1 or 0 (both LOW).
+static int8_t gDir[MOTOR_CHANNEL_COUNT] = { 0, 0, 0, 0 };
+
+static int channelIndexOf(const MotorChannel *m)
+{
+    return (int)(m - gMotors);
+}
+
+static int signOf(int v)
+{
+    return (v > 0) - (v < 0);
+}
+
+// GPIO only: both direction inputs LOW. Never touches the I2C bus.
+static void cutDirection(const MotorChannel *m)
+{
+    digitalWrite(m->pinIn1, LOW);
+    digitalWrite(m->pinIn2, LOW);
+    gDir[channelIndexOf(m)] = 0;
+}
 
 static void writeChannel(const MotorChannel *m, int speed)
 {
+    // ---- Stop: direction LOW first (GPIO), then the enable (I2C). ----
+    if (speed == 0) {
+        cutDirection(m);
+        (void)pca9685SetDuty(m->enableCh, 0);
+        return;
+    }
+
     // ---- 1. Enable off. ----
-    (void)pca9685SetDuty(m->enableCh, 0);
+    if (!pca9685SetDuty(m->enableCh, 0)) {
+        cutDirection(m);                // enable state unknown: hold it stopped
+        return;
+    }
 
     // ---- 2. Direction. ----
     if (speed > 0) {
         digitalWrite(m->pinIn1, HIGH);
         digitalWrite(m->pinIn2, LOW);
-    } else if (speed < 0) {
-        digitalWrite(m->pinIn1, LOW);
-        digitalWrite(m->pinIn2, HIGH);
     } else {
         digitalWrite(m->pinIn1, LOW);
-        digitalWrite(m->pinIn2, LOW);
-        return;                         // enable already zero -- done
+        digitalWrite(m->pinIn2, HIGH);
     }
+    gDir[channelIndexOf(m)] = (int8_t)signOf(speed);
 
     // ---- 3. Speed. ----
     int magnitude = (speed < 0) ? -speed : speed;
     (void)pca9685SetDuty(m->enableCh, speedToDuty12(magnitude));
+}
+
+// Apply one speed per channel (already clamped, deadbanded and polarity-
+// mapped). Every channel that stops or reverses has its direction cut over
+// GPIO in a first pass, BEFORE the first I2C write of the second pass -- so a
+// hung bus while servicing channel 0 cannot hold channel 3 driven.
+static void applyChannelSpeeds(const int speeds[MOTOR_CHANNEL_COUNT])
+{
+    for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
+        if (signOf(speeds[i]) != gDir[i]) {
+            cutDirection(&gMotors[i]);
+        }
+    }
+    for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
+        writeChannel(&gMotors[i], speeds[i]);
+    }
 }
 
 
@@ -228,6 +284,7 @@ void driveDifferential(int leftSpeed, int rightSpeed)
     leftSpeed  = applyDeadband(clampSpeed(leftSpeed));
     rightSpeed = applyDeadband(clampSpeed(rightSpeed));
 
+    int speeds[MOTOR_CHANNEL_COUNT];
     for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
         int speed = (gMotors[i].side == SIDE_LEFT) ? leftSpeed : rightSpeed;
 
@@ -235,24 +292,29 @@ void driveDifferential(int leftSpeed, int rightSpeed)
             speed = -speed;
         }
 
-        writeChannel(&gMotors[i], speed);
+        speeds[i] = speed;
     }
+    applyChannelSpeeds(speeds);
 }
 
 
 void stopMotors(void)
 {
-    // Enables first, in ONE transaction where possible. pca9685AllOff() kills
-    // all sixteen outputs with a single write, which is materially faster than
-    // four separate channel writes on the emergency path.
+    // 1. GPIO first: every direction input LOW, for all four channels, before
+    //    anything touches the I2C bus (see "ONE CHANNEL" above). This part
+    //    cannot be held up by a hung bus.
+    for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
+        cutDirection(&gMotors[i]);
+    }
+
+    // 2. Then the enables, in ONE transaction where possible. pca9685AllOff()
+    //    kills all sixteen outputs with a single write, which is materially
+    //    faster than four separate channel writes.
     (void)pca9685AllOff();
 
+    // 3. Belt and braces: also zero each channel, so a stop is correct even if
+    //    the ALL_LED write above failed.
     for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
-        digitalWrite(gMotors[i].pinIn1, LOW);
-        digitalWrite(gMotors[i].pinIn2, LOW);
-
-        // Belt and braces: also zero the individual channel, so a stop is
-        // correct even if the ALL_LED write above failed.
         (void)pca9685SetDuty(gMotors[i].enableCh, 0);
     }
 }
@@ -307,12 +369,14 @@ void motorDriveChannel(int channelIndex, int speed)
 
     speed = applyDeadband(clampSpeed(speed));
 
+    // Deliberately does NOT apply side/invert mapping. This drives the raw
+    // hardware channel so you can observe its true behaviour and then fill in
+    // MOTOR_*_SIDE / MOTOR_*_INVERT in config.h from observation.
+    int speeds[MOTOR_CHANNEL_COUNT];
     for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
-        // Deliberately does NOT apply side/invert mapping. This drives the
-        // raw hardware channel so you can observe its true behaviour and then
-        // fill in MOTOR_*_SIDE / MOTOR_*_INVERT in config.h from observation.
-        writeChannel(&gMotors[i], (i == channelIndex) ? speed : 0);
+        speeds[i] = (i == channelIndex) ? speed : 0;
     }
+    applyChannelSpeeds(speeds);
 }
 
 const char *motorChannelName(int channelIndex)
