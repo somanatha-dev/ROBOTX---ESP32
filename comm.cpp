@@ -85,6 +85,17 @@ static bool     gTimedOut        = false;
 // RobotState value.
 static bool     gSafetyStopLatched = false;
 
+// Drive-loss acknowledgement (see "DRIVE LOSS -> SAFETY-STOP LATCH" below).
+static bool     gLossUnacked      = false;  // a drive loss was latched; no eligible RESET yet
+static bool     gSettling         = false;  // the drive has been reported available since
+                                            // the loss / last outage; settle clock running
+static uint32_t gSettleStartMs    = 0;      // when that first report was queued
+static bool     gAvailReported    = false;  // the settle period passed and a report was
+                                            // queued after it: the ack window is open
+static uint32_t gPreReportRxBytes = 0;      // RX bytes already received when that report
+                                            // was queued, not yet read
+static bool     gLineAfterReport  = false;  // the line being assembled began after it
+
 // Incoming line assembly. No terminator is stored; lengths are passed.
 static char     gLine[COMM_LINE_MAX];
 static uint16_t gLineLen  = 0;
@@ -562,8 +573,97 @@ static RobotState computeState(void)
     return stateForMotion(gAppliedLeft, gAppliedRight);
 }
 
+// ============================================================================
+// DRIVE LOSS -> SAFETY-STOP LATCH, AND ITS ACKNOWLEDGEMENT
+// ============================================================================
+//
+// The motor layer records, at the instant a PCA9685 enable write fails,
+// whether motion was lost: output live, or a non-zero speed being written
+// (motorConsumeLostWhileLive()). That is a stop the controller made on its
+// own, so it latches safety_stop like a gate clamp does. The record is
+// absorbed HERE, and this runs before anything that could read, clear or
+// bypass the latch: every received line (so a RESET or DRIVE arriving during
+// a hung write is handled AFTER the evidence, never instead of it), every
+// runtime update, the no-drive discard and telemetry.
+//
+// A drive loss must then be ACKNOWLEDGED, and only by a RESET that could have
+// been sent with the recovery in view. Until then (gLossUnacked):
+//   * safety_stop is HELD: re-asserted on every absorb, whatever cleared it;
+//   * DRIVE / MOVE are GATED and MOTORTEST is REJECTED, reason
+//     DRIVE_LOSS_UNACKNOWLEDGED -- otherwise a "fully permitted" DRIVE after
+//     recovery would clear the latch (applyMotion()) and move without one;
+//   * a RESET is still ACCEPTED (it stops the motors and clears the command
+//     timeout, as always) but acknowledges the loss ONLY if the drive is
+//     available AND the RESET line began arriving after the SETTLE SNAPSHOT
+//     (resetAcknowledgesLoss()).
+//
+// The settle snapshot. The ESP32 sees only when a report is QUEUED and when a
+// byte reaches its RX ring buffer -- not when the Pi has the report (~50-130
+// ms later), and not the bytes of a frame still in the UART hardware FIFO
+// (Serial.available() counts the ring only). So the first "drive available"
+// report merely starts a settle clock; the snapshot is taken at the first
+// report queued once the drive has been available and reported CONTINUOUSLY
+// for ACK_SETTLE_MS (config.h). Every byte already in the ring at that moment
+// is counted off by commPoll() first; a line is eligible only if its first
+// byte comes after them. A RESET sent before the Pi could see the recovery
+// reaches the ring long before the snapshot and is excluded; the bytes the
+// snapshot cannot see (FIFO, in flight) were sent ~ACK_SETTLE_MS after the
+// first report. Any outage or new loss voids all of it and restarts the clock
+// (voidAckWindow()). Recovery itself never clears any of this.
+// ============================================================================
+
+static void voidAckWindow(void)
+{
+    gSettling         = false;
+    gAvailReported    = false;
+    gPreReportRxBytes = 0;
+    gLineAfterReport  = false;
+}
+
+static void absorbDriveLoss(void)
+{
+    if (motorConsumeLostWhileLive()) {
+        gLossUnacked = true;
+        voidAckWindow();                // the ack must follow a settle after THIS loss
+    }
+    if (gLossUnacked) {
+        gSafetyStopLatched = true;
+    }
+}
+
+// Called once a fast TELEMETRY frame has been queued. While a loss is
+// unacknowledged and the drive is available: the first such report starts the
+// settle clock; the first report at or after ACK_SETTLE_MS takes the snapshot
+// and opens the acknowledgement window.
+static void noteAvailabilityReported(void)
+{
+    if (!gLossUnacked || gAvailReported || !motorDriveAvailable()) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    if (!gSettling) {
+        gSettling      = true;
+        gSettleStartMs = now;
+        return;
+    }
+
+    if ((uint32_t)(now - gSettleStartMs) >= ACK_SETTLE_MS) {
+        gAvailReported    = true;
+        gPreReportRxBytes = (uint32_t)Serial.available();
+    }
+}
+
+static bool resetAcknowledgesLoss(void)
+{
+    return motorDriveAvailable() && gAvailReported && gLineAfterReport;
+}
+
 void commUpdateRuntime(int gatedLeft, int gatedRight, const char *blockReason)
 {
+    absorbDriveLoss();
+
     gGatedLeft  = gatedLeft;
     gGatedRight = gatedRight;
 
@@ -670,14 +770,30 @@ static void applyMotion(int left, int right)
     // a verified one there is nothing to command. Reported as GATED, not
     // REJECTED: the command itself was valid and the link is alive.
     //
-    // The stored intent is kept, not cleared, so that if the PCA9685 becomes
-    // available the next loop pass acts on what the Pi is still asking for --
-    // the same rule the obstacle gate follows.
+    // The request is DISCARDED, not stored. The drive can now come back at
+    // runtime (pca9685ServiceRecovery()), and a request made while it was
+    // unavailable must not start the wheels the moment it does: after a
+    // recovery, motion needs a brand-new command. loop() enforces the same
+    // rule every pass (commDiscardMotionNoDrive()).
     // ------------------------------------------------------------------
     if (!motorDriveAvailable()) {
+        gDesiredLeft  = 0;
+        gDesiredRight = 0;
         stopMotors();
         commUpdateRuntime(0, 0, "MOTOR_PWM_UNAVAILABLE");
         ackMotion("GATED", "MOTOR_PWM_UNAVAILABLE", left, right);
+        return;
+    }
+
+    // A drive loss not yet acknowledged by an eligible RESET: discarded, like
+    // the above. Without this, the "fully permitted" path below would clear
+    // the latch and move -- a DRIVE standing in for the acknowledgement.
+    if (gLossUnacked) {
+        gDesiredLeft  = 0;
+        gDesiredRight = 0;
+        stopMotors();
+        commUpdateRuntime(0, 0, "DRIVE_LOSS_UNACKNOWLEDGED");
+        ackMotion("GATED", "DRIVE_LOSS_UNACKNOWLEDGED", left, right);
         return;
     }
 
@@ -869,6 +985,13 @@ static bool validateMotorTest(int *motor, int *power, int *ms)
         return false;
     }
 
+    // MOTORTEST bypasses the obstacle gate; it must not bypass the
+    // acknowledgement of a drive loss as well.
+    if (gLossUnacked) {
+        ackReject("DRIVE_LOSS_UNACKNOWLEDGED", NULL);
+        return false;
+    }
+
     return true;
 }
 
@@ -934,8 +1057,15 @@ static void handleReset(void)
     gDesiredRight = 0;
 
     // RESET is the explicit acknowledgement of a safety stop. It clears the
-    // latch but commands NO motion.
-    gSafetyStopLatched = false;
+    // latch but commands NO motion. A latch that holds an unacknowledged
+    // DRIVE LOSS is cleared only by an eligible RESET (see
+    // resetAcknowledgesLoss()); any other RESET is still accepted, stops the
+    // motors and clears the command timeout, and leaves the latch set --
+    // TELEMETRY "safety_stop" says which happened.
+    if (!gLossUnacked || resetAcknowledgesLoss()) {
+        gLossUnacked       = false;
+        gSafetyStopLatched = false;
+    }
     gTimedOut          = false;
 
     // NOTE: does NOT refresh gLastCommandMs. RESET is not a movement command,
@@ -1449,6 +1579,8 @@ static void badEnvelope(const char *reason, long seq, const char *field)
 
 void handleCommand(const char *line, size_t len)
 {
+    absorbDriveLoss();                  // evidence first, then any command
+
     ProtoStatus st = protoParseFrame(line, len, &gMsg);
 
     if (st == PROTO_EMPTY) {
@@ -1605,6 +1737,17 @@ void commPoll(void)
     while (Serial.available() > 0) {
         char c = (char)Serial.read();
 
+        // Drive-loss acknowledgement bookkeeping: was this byte already
+        // received when the drive was reported available? A line is eligible
+        // to acknowledge only if its FIRST byte came after that report.
+        bool preReport = (gPreReportRxBytes > 0);
+        if (preReport) {
+            gPreReportRxBytes--;
+        }
+        if (gLineLen == 0 && !gOverflow) {
+            gLineAfterReport = gAvailReported && !preReport;
+        }
+
         if (c == '\n') {
             if (gOverflow) {
                 gOverflow = false;
@@ -1740,6 +1883,8 @@ static void sendFastTelemetry(void)
     txBool("command_timeout", gTimedOut);
     txBool("motor_drive_available", motorDriveAvailable());
     txEnd();
+
+    noteAvailabilityReported();
 }
 
 static void txDiagFront(void)
@@ -1935,6 +2080,13 @@ static void txDiagSystem(void)
     txBool("tca_address_confirmed", tcaAddressConfirmed());
     txBool("pca_address_confirmed", pca9685AddressConfirmed());
     txStr("motor_drive_status", motorDriveStatusName());
+    txStr("pca_recovery", pca9685RecoveryName());
+    txStr("pca_last_fault", pca9685LastFaultName());
+    tx(",\"pca_recovery_attempts\":%u,\"pca_recoveries\":%u,"
+       "\"pca_runtime_bus_errors\":%u,\"pca_next_retry_ms\":%lu",
+       (unsigned)pca9685RecoveryAttempts(), (unsigned)pca9685Recoveries(),
+       (unsigned)pca9685RuntimeBusErrors(),
+       (unsigned long)pca9685NextRetryInMs());
     txBool("motor_map_verified", motorMapVerified());
     txBool("command_ever_received", gEverReceivedCmd);
     tx(",\"left_gated\":%d,\"right_gated\":%d", gGatedLeft, gGatedRight);
@@ -1992,6 +2144,8 @@ static uint32_t gLastGpsFrameMs = 0;
 
 void commServiceTelemetry(void)
 {
+    absorbDriveLoss();                  // never report a latch the record predates
+
     uint32_t now  = millis();
     bool     sent = false;
 
@@ -2045,6 +2199,12 @@ void commInit(void)
     gEverReceivedCmd   = false;
     gTimedOut          = false;
     gSafetyStopLatched = false;
+    gLossUnacked       = false;
+    gSettling          = false;
+    gSettleStartMs     = 0;
+    gAvailReported     = false;
+    gPreReportRxBytes  = 0;
+    gLineAfterReport   = false;
     gLastCommandMs     = millis();
     gHaveLastSeq       = false;
     gLastSeq           = 0;
@@ -2059,6 +2219,22 @@ bool commSafetyStopLatched(void) { return gSafetyStopLatched;  }
 
 int commDesiredLeft(void)   { return gDesiredLeft;  }
 int commDesiredRight(void)  { return gDesiredRight; }
+
+void commDiscardMotionNoDrive(void)
+{
+    // Whether motion was lost was recorded by the motor layer when the write
+    // failed; nothing processed since can have changed it.
+    absorbDriveLoss();
+
+    endMotorTest("CANCELLED");          // no-op unless one is running
+    gDesiredLeft  = 0;
+    gDesiredRight = 0;
+
+    // The drive is down: any earlier report of it being available no longer
+    // stands, the settle clock restarts from the next report after it comes
+    // back, and no line already begun can count as received after a snapshot.
+    voidAckWindow();
+}
 
 void commClearDesired(void)
 {

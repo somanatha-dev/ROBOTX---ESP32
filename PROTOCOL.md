@@ -125,7 +125,7 @@ rejected with `UNKNOWN_FIELD`.** Ranges are inclusive, and values outside them a
 | `DRIVE` | `left` int −255…255, `right` int −255…255 | differential drive request | **yes** (result ACCEPTED or GATED) |
 | `STOP` | — | zero both sides, hold stopped | **yes** |
 | `MOVE` | `dir` `"F"`/`"B"`/`"L"`/`"R"`/`"S"`; `speed` int 0…255 (optional only for `"S"`) | F=(s,s) B=(−s,−s) L=(55%·s,s) R=(s,55%·s) S=STOP | **yes**, except an invalid `dir` |
-| `RESET` | — | clear the safety-stop and timeout latches; no motion | no |
+| `RESET` | — | clear the safety-stop and timeout latches; no motion (a drive-loss latch only once the recovered drive has been reported available for `ACK_SETTLE_MS`, §9) | no |
 | `PING` | — | liveness; ACK carries `state`, `uptime_ms`, `proto` | no |
 | `MOTORTEST` | `motor` 0…3, `power` −255…255, `ms` 1…3000, `onblocks` bool (must be `true`) | spin ONE raw channel, safety gate bypassed. **Rover on blocks.** | no |
 | `I2CSCAN` | — | scan 0x08–0x77; refused while the wheels are driven | no |
@@ -212,8 +212,55 @@ For DRIVE, MOVE and STOP the ACK also carries three pairs of values:
 Since out-of-range values are rejected, `applied` can only differ from `gated` through the
 deadband (|v| < 40 → 0) or through drive being unavailable.
 
-GATED reasons: `MOTOR_PWM_UNAVAILABLE`, `FRONT_OBSTACLE`, `FRONT_SENSOR_FAULT`,
-`REAR_OBSTACLE`, `REAR_SENSOR_FAULT`, `REAR_UNCONFIGURED`.
+GATED reasons: `MOTOR_PWM_UNAVAILABLE`, `DRIVE_LOSS_UNACKNOWLEDGED`, `FRONT_OBSTACLE`,
+`FRONT_SENSOR_FAULT`, `REAR_OBSTACLE`, `REAR_SENSOR_FAULT`, `REAR_UNCONFIGURED`.
+
+`MOTOR_PWM_UNAVAILABLE`: no ready PCA9685. The command is **discarded** (TELEMETRY
+`left_cmd`/`right_cmd` read 0), whatever `SAFETY_CLEAR_COMMAND_ON_BLOCK` says. The firmware
+retries the PCA9685 bring-up at runtime (DIAG SYSTEM `pca_recovery`), and a drive that comes
+back starts at 0/0: motion needs a new command sent after `motor_drive_available` is true
+again. A running MOTORTEST is cancelled (`MOTORTEST_DONE` `CANCELLED`) when the drive is
+lost.
+
+When a PCA9685 enable write fails, the motor layer drives **all eight** L298N direction
+inputs LOW before it returns, including channels it had already written in that same call;
+no further write is attempted. If any direction input was driven at the instant of the
+failure, or the failing call was writing any non-zero speed (a DRIVE or MOTORTEST that
+failed on its very first write, from rest, included), that is a **drive loss**: `safety_stop`
+is latched, as for any other stop the controller makes on its own. A failure while only
+stopping, with nothing driven, is not. The loss is recorded at the failure itself and
+latched before the next command, runtime update or TELEMETRY frame, so a DRIVE, STOP, PING
+or RESET arriving while the write was failing or hung cannot erase it.
+
+A drive loss must be **acknowledged**. PCA9685 recovery never clears it. Until it is
+acknowledged, `safety_stop` stays `true` (also after recovery), DRIVE and MOVE are `GATED`
+`DRIVE_LOSS_UNACKNOWLEDGED` (discarded, `left_cmd` 0) and MOTORTEST is `REJECTED`
+`DRIVE_LOSS_UNACKNOWLEDGED`. Only a RESET acknowledges it, and only after a **settle
+period**: the first TELEMETRY frame with `motor_drive_available:true` after the outage starts
+a clock; once the drive has stayed available — and reported available — for
+`ACK_SETTLE_MS` (`config.h`, 1000 ms), the next such frame opens the acknowledgement window.
+A RESET acknowledges only if the first byte of its line reached the ESP32's UART receive
+buffer **after** that window-opening frame was queued, and the drive is still available.
+Any outage, or a new drive loss, closes the window and restarts the clock. Any other RESET
+is still `ACCEPTED` — it stops the motors and clears `command_timeout` as always — but leaves
+`safety_stop` `true`; TELEMETRY, not the ACK, shows whether the controller is clear. So a
+RESET sent while the drive was down, or within about a second of it coming back (including
+one that arrives during a recovery attempt and is processed just after it), acknowledges
+nothing: the operator RESETs again once TELEMETRY has shown the drive back for a second.
+Motion then still needs a new DRIVE.
+
+Why the settle period: the ESP32 sees only when a frame is *queued* and when a byte reaches
+its UART receive buffer. The Pi has a report ~50–130 ms after it is queued, and the bytes of
+a frame still arriving can sit in the UART hardware FIFO, which `Serial.available()` does
+not count, for the frame's whole length (core 2.0.14 at 115200: FIFO-full threshold 120
+bytes, RX timeout 2 symbols; ~5–10 ms). A RESET sent before the Pi saw the recovery reaches
+the receive buffer well before the window opens and is excluded. **Assumption, not proven:**
+the Pi's delay from receiving a report to its RESET reaching the ESP32 is under about
+`ACK_SETTLE_MS` minus 200 ms.
+
+These are host-tested orderings (the host simulator models the hardware FIFO and the report
+queue); none of it has been validated on the rover. How long a hung I2C write takes on the
+rover (≥ 1 s on core 2.0.14) is unchanged.
 
 `REAR_UNCONFIGURED`: rear sensing never came up this boot (TCA9548A address unconfirmed, the
 TCA9548A did not answer, or no rear sensor initialised). Any reverse wheel is then refused
@@ -263,13 +310,13 @@ Every EVENT carries `seq` (null except `MOTORTEST_DONE`) and `uptime_ms`.
 |---|---|
 | `state`, `block_reason` | recomputed state; why the gate is clamping (or `NONE`) |
 | `last_seq`, `last_reject` | last ACKed seq (null after boot); last rejection reason |
-| `left_cmd`/`right_cmd` | what the Pi requested |
+| `left_cmd`/`right_cmd` | the stored request the controller is acting on: what the Pi last requested, or 0 once it was discarded (STOP, watchdog, RESET, a GATED command under `SAFETY_CLEAR_COMMAND_ON_BLOCK 1`, and always for `MOTOR_PWM_UNAVAILABLE`) |
 | `left_applied`/`right_applied` | what the motor layer outputs (§9) |
 | `front_*_cm` | filtered distance, one decimal, **uncalibrated**; `null` when not a valid measurement |
 | `front_valid`, `front_obstacle`, `front_warning` | front sensing trustworthy / latched obstacle / advisory |
 | `rear_mm` | three VL53L0X by **TCA channel** (not left/centre/right), `null` when invalid |
 | `rear_available`, `rear_obstacle`, `rear_sensor_fault` | rear backend reachable / latched obstacle / policy fault |
-| `forward_blocked`, `reverse_blocked`, `safety_stop` | gates; latched safety stop |
+| `forward_blocked`, `reverse_blocked`, `safety_stop` | gates; latched safety stop (set by a gate clamp, or by a drive loss; cleared only by RESET or a new fully permitted command — a drive loss only by a RESET received once the recovered drive has been reported available for `ACK_SETTLE_MS`, §9) |
 | `command_age_ms`, `command_timeout` | watchdog age; latch |
 | `motor_drive_available` | false means no wheel can turn, whatever is sent |
 
@@ -279,7 +326,7 @@ Every EVENT carries `seq` (null except `MOTORTEST_DONE`) and `uptime_ms`.
 |---|---|
 | `FRONT` | `front_left_valid`, `front_right_valid`, `front_left_health`, `front_right_health`, `front_health`, `front_closest_cm`, `sensor_map_verified`; debug: `front_*_raw_cm`, `front_*_samples`, `front_*_timeout_streak` |
 | `REAR` | `rear_backend`, `rear_orientation_verified`, `rear_positions` (physical position per index, e.g. `["CENTRE","LEFT","RIGHT"]`; `null` while unverified), arrays `rear_sensor_valid` / `_status` / `_health` / `_obstacle`, `rear_health`, `rear_closest_mm`, `rear_warning`, BUS_ERROR record per sensor: `rear_bus_err_streak` (consecutive visits ending in a VL53L0X-transaction BUS_ERROR; excludes `TCA_SELECT`; reset by any visit where the sensor answered and by demotion; reaching 50 demotes the sensor: it is no longer polled and stays failed until the next boot), `rear_bus_err_total` (every BUS_ERROR since boot, `TCA_SELECT` included), `rear_bus_err_code` (raw Wire `endTransmission()` code, 0 = none yet: for `TCA_SELECT` the mask write, for `READY_REGISTER` / `RANGE_STATUS` that register's pointer write, for `RANGE_READ` the LAST write inside the library's range read — normally the interrupt clear, not the range data itself; read-phase failures are never reported, and a failed 16-bit range data read surfaces as `TIMEOUT`), `rear_bus_err_site` (site of the latest BUS_ERROR: `NONE`/`TCA_SELECT`/`READY_REGISTER`/`RANGE_STATUS`/`RANGE_READ`), `rear_reinit_count` (runtime re-init attempts; always 0 in the shipped firmware, where `config.h` `REAR_TOF_RUNTIME_REINIT` is 0 because a re-init from `loop()` can stall it for seconds — boot init and `TOFTEST` are never counted), `rear_reinit_result` (latest such attempt: `NONE`/`OK`/`FAILED`); debug: `rear_sensor_raw_mm`, `rear_fail_streak`, `rear_tca_channels` |
-| `SYSTEM` | `proto`, `fw_build`, `fw_build_utc` (as in READY), `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, loop timing (all since boot, ms of `millis()`): `loop_max_ms` (longest single `loop()` pass, excluding its trailing 1 ms yield), `loop_max_source` (slowest section of that pass), `last_stall_ms` / `last_stall_source` / `last_stall_uptime_ms` (latest pass ≥ `LOOP_STALL_THRESHOLD_MS` = 50 ms, its slowest section, and when it ended; `0`, `"NONE"`, `0` until one happens), `stall_count` (passes ≥ 50 ms); sections: `COMM_RX` (UART reading and every command handler, diagnostics included), `REAR_TOF`, `FRONT_US`, `MOTORTEST`, `MOTOR` (watchdog, gate, motor writes), `TELEMETRY`, `GPS`, `NONE`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
+| `SYSTEM` | `proto`, `fw_build`, `fw_build_utc` (as in READY), `i2c_ready`, `tca_status`, `pca_status`, `tca_address_confirmed`, `pca_address_confirmed`, `motor_drive_status`, PCA9685 runtime recovery: `pca_recovery` (`NONE` = ready and never recovered this boot, or address unconfirmed; `RETRYING` = not ready, the full bring-up is being retried — first 1 s after the loss, then every 2, 4, 8, 16 s, then every 30 s; `RECOVERED` = ready again after at least one recovery this boot), `pca_last_fault` (cause of the most recent loss this boot: `NONE` / `BOOT_INIT` / `RUNTIME_BUS`), `pca_recovery_attempts`, `pca_recoveries`, `pca_runtime_bus_errors` (losses caused by a failed write), `pca_next_retry_ms` (0 when not retrying) — while retrying, `pca_status` is the outcome of the latest attempt (`NOT_FOUND` / `INIT_FAILED`, or `BUS_ERROR` before the first one), `motor_map_verified`, `command_ever_received`, `left_gated`, `right_gated`, loop timing (all since boot, ms of `millis()`): `loop_max_ms` (longest single `loop()` pass, excluding its trailing 1 ms yield), `loop_max_source` (slowest section of that pass), `last_stall_ms` / `last_stall_source` / `last_stall_uptime_ms` (latest pass ≥ `LOOP_STALL_THRESHOLD_MS` = 50 ms, its slowest section, and when it ended; `0`, `"NONE"`, `0` until one happens), `stall_count` (passes ≥ 50 ms); sections: `COMM_RX` (UART reading and every command handler, diagnostics included), `REAR_TOF`, `FRONT_US`, `MOTORTEST`, `MOTOR` (watchdog, gate, motor writes, PCA9685 recovery attempts), `TELEMETRY`, `GPS`, `NONE`, `link{rx_ok, rx_empty, rx_bad_frame, rx_bad_crc, rx_bad_message, rx_too_long, rx_rejected, rx_duplicates, rx_stale, errors_suppressed, tx_overflows}` |
 
 Debug keys are controlled by `TELEMETRY_INCLUDE_DEBUG` in `config.h`.
 
@@ -382,7 +429,7 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 |---|---|---|
 | TELEMETRY, typical | 565 | 49.0 ms (24.5 % of its 200 ms slot) |
 | TELEMETRY, worst case (every field at maximum width) | 621 | 53.9 ms (27.0 %) |
-| DIAG FRONT / REAR / SYSTEM | 391 / 689–730 / ~680–725 (SYSTEM with the loop-timing and build-identity keys) | 33.9 / 59.8–63.4 / ~59–63 ms |
+| DIAG FRONT / REAR / SYSTEM | 391 / 689–730 / ~815–860 (SYSTEM with the loop-timing, build-identity and PCA9685-recovery keys) | 33.9 / 59.8–63.4 / ~71–75 ms |
 | DIAG REAR, worst case (every field at maximum width) | 849 | 73.7 ms |
 | ACK DRIVE (−255/−255) | 195 | 16.9 ms |
 | ACK PING / STOP | 136 / 174 | 11.8 / 15.1 ms |
@@ -392,9 +439,9 @@ Measured on the host simulator, which runs the real formatting code; 10 bits per
 | Command DRIVE / longest command (MOTORTEST) | 70–75 / 103 | 6.1–6.5 / 8.9 ms |
 
 Steady-state ESP32 → Pi load: fast ≈ 2825 B/s + DIAG ≈ 1530 B/s ≈ **38 %** of the link
-(measured 37–39 % including test command traffic before the loop-timing and build-identity
-keys added ~200 B to each DIAG SYSTEM, one every 1.2 s, i.e. ~165 B/s), against ≈ **92 %**
-for the v1 telemetry line.
+before the loop-timing, build-identity and PCA9685-recovery keys, which grew each DIAG
+SYSTEM from ~675 to ~815–860 B (one every 1.2 s). The host simulator now measures
+**42.5–44.2 %** including test command traffic, against ≈ **92 %** for the v1 telemetry line.
 
 **ACK latency, estimated for a physical 115200 link in normal operation** (DRIVE
 command, 70 B up and 195 B back):
@@ -418,5 +465,7 @@ python tests/test_link.py --port /dev/ttyAMA0   # from the Pi 5, against the rea
 ```
 
 The simulator compiles the real sketch with only the Arduino core, Wire, the VL53L0X
-library and the PCA9685 driver stubbed. The link suite refuses to run against real hardware
+library and the PCA9685 driver stubbed. The real PCA9685 driver and its runtime recovery
+are covered separately by `tests/host/test_pca_recovery.cpp`, against a register-level fake
+of the part. The link suite refuses to run against real hardware
 that reports `motor_drive_available:true` unless `--allow-motion` is given.

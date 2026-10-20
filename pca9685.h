@@ -55,11 +55,33 @@
 // Call once from setup(), after roverI2cInit() and with all TCA channels
 // deselected (the PCA9685 is on the MAIN bus segment, not behind the mux).
 //
-// Returns false when the address is unconfirmed or the chip did not answer.
-// A false return is not recoverable by retrying in a loop -- it is a wiring or
-// configuration fact, and motor.cpp treats it as "no motion is possible".
+// Returns false when the address is unconfirmed, the chip did not answer, or
+// it did not read back the configuration written to it. motor.cpp treats that
+// as "no motion is possible" until pca9685ServiceRecovery() brings it back.
 // ---------------------------------------------------------------------------
 bool pca9685Init(void);
+
+// ---------------------------------------------------------------------------
+// RUNTIME RECOVERY. Call once per loop() pass, ONLY after every stored motion
+// request has been discarded (see the .cpp). While the chip is not ready it
+// re-runs the full boot bring-up -- outputs forced full-off first and last --
+// on a backoff schedule (config.h PCA9685_RECOVERY_*). Returns true on the
+// call that brought the chip back. A no-op while ready or unconfirmed.
+// ---------------------------------------------------------------------------
+bool pca9685ServiceRecovery(void);
+
+// Recovery reporting, for DIAG SYSTEM:
+//   pca9685RecoveryName()  "NONE"      ready and never recovered (or unconfirmed)
+//                          "RETRYING"  not ready; bring-up is being retried
+//                          "RECOVERED" ready again after >= 1 recovery this boot
+//   pca9685LastFaultName() "NONE" / "BOOT_INIT" / "RUNTIME_BUS": what caused the
+//                          most recent loss of the drive this boot
+const char *pca9685RecoveryName(void);
+const char *pca9685LastFaultName(void);
+uint16_t    pca9685RecoveryAttempts(void);  // bring-up retries since boot
+uint16_t    pca9685Recoveries(void);        // retries that succeeded
+uint16_t    pca9685RuntimeBusErrors(void);  // losses caused by a failed write
+uint32_t    pca9685NextRetryInMs(void);     // 0 when not retrying
 
 // True when config.h says a human has confirmed the address.
 bool pca9685AddressConfirmed(void);
@@ -67,8 +89,8 @@ bool pca9685AddressConfirmed(void);
 // The configured address. Meaningless unless pca9685AddressConfirmed().
 uint8_t pca9685Address(void);
 
-// True only when the chip was found AND initialised AND has not errored since.
-// motor.cpp gates all motion on this.
+// True only when the chip was found AND initialised AND has not errored since
+// its last successful bring-up. motor.cpp gates all motion on this.
 bool pca9685Ready(void);
 
 // Why it is unusable, for telemetry:
@@ -85,7 +107,8 @@ const char *pca9685StatusName(void);
 //
 // Returns false on any I2C failure, and latches a bus error so
 // pca9685Ready() goes false -- a motor enable line we failed to write is a
-// motor enable line in an unknown state.
+// motor enable line in an unknown state. Only a complete bring-up (boot, or
+// pca9685ServiceRecovery()) clears it.
 // ---------------------------------------------------------------------------
 bool pca9685SetDuty(uint8_t channel, uint16_t duty);
 

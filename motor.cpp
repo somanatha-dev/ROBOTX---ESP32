@@ -125,14 +125,29 @@ static uint16_t speedToDuty12(int magnitude)
 //   2. SET DIRECTION. Plain digitalWrite. These pins are never PWM'd.
 //   3. RAISE THE ENABLE to the commanded duty.
 //
-// If step 1 fails, the enable may still be live: the channel is held stopped
-// (direction LOW) for this call instead of being given a direction. A failed
-// PCA9685 write also latches BUS_ERROR in pca9685.cpp, so motorDriveAvailable()
-// is false from then on and every later call goes through stopMotors().
+// A FAILED ENABLE WRITE, at any step of any channel, leaves every enable in an
+// unknown state. applyChannelSpeeds() then drives ALL EIGHT direction inputs
+// LOW before it returns -- including channels it already wrote earlier in the
+// same call -- and writes nothing more. A failed PCA9685 write also latches
+// BUS_ERROR in pca9685.cpp, so motorDriveAvailable() is false, and every later
+// call goes through stopMotors(), until the chip is recovered
+// (motorDriveRecoveryService()).
+//
+// The failure is also RECORDED here, at the instant it happens: if any
+// direction input was driven at that moment, or the call was asking for any
+// non-zero speed, motion was lost. comm.cpp turns that record into the
+// safety_stop latch
+// (motorConsumeLostWhileLive()). Recording it here, rather than inferring it
+// later from what comm.cpp last commanded, means no command processed in
+// between -- a DRIVE, STOP or PING arriving during a hung write -- can erase
+// the evidence.
 // ============================================================================
 
 // The direction each channel's inputs were last set to: +1, -1 or 0 (both LOW).
 static int8_t gDir[MOTOR_CHANNEL_COUNT] = { 0, 0, 0, 0 };
+
+// A PCA9685 write failed while output was live, not yet consumed by comm.cpp.
+static bool gLostWhileLive = false;
 
 static int channelIndexOf(const MotorChannel *m)
 {
@@ -152,19 +167,44 @@ static void cutDirection(const MotorChannel *m)
     gDir[channelIndexOf(m)] = 0;
 }
 
-static void writeChannel(const MotorChannel *m, int speed)
+static void cutAllDirections(void)
+{
+    for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
+        cutDirection(&gMotors[i]);
+    }
+}
+
+// Called the moment an enable write fails, BEFORE any direction is cut for
+// it: was any direction input driven, i.e. could any wheel be turning?
+static void noteWriteFailure(void)
+{
+    for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
+        if (gDir[i] != 0) {
+            gLostWhileLive = true;
+            return;
+        }
+    }
+}
+
+// Returns false if a PCA9685 write for this channel failed (the failure has
+// been recorded; the caller cuts every channel).
+static bool writeChannel(const MotorChannel *m, int speed)
 {
     // ---- Stop: direction LOW first (GPIO), then the enable (I2C). ----
     if (speed == 0) {
         cutDirection(m);
-        (void)pca9685SetDuty(m->enableCh, 0);
-        return;
+        if (!pca9685SetDuty(m->enableCh, 0)) {
+            noteWriteFailure();         // other channels may still be driven
+            return false;
+        }
+        return true;
     }
 
     // ---- 1. Enable off. ----
     if (!pca9685SetDuty(m->enableCh, 0)) {
+        noteWriteFailure();             // this channel may still be turning
         cutDirection(m);                // enable state unknown: hold it stopped
-        return;
+        return false;
     }
 
     // ---- 2. Direction. ----
@@ -179,13 +219,28 @@ static void writeChannel(const MotorChannel *m, int speed)
 
     // ---- 3. Speed. ----
     int magnitude = (speed < 0) ? -speed : speed;
-    (void)pca9685SetDuty(m->enableCh, speedToDuty12(magnitude));
+    if (!pca9685SetDuty(m->enableCh, speedToDuty12(magnitude))) {
+        noteWriteFailure();             // the direction was just set: live
+        return false;
+    }
+    return true;
 }
 
 // Apply one speed per channel (already clamped, deadbanded and polarity-
 // mapped). Every channel that stops or reverses has its direction cut over
-// GPIO in a first pass, BEFORE the first I2C write of the second pass -- so a
-// hung bus while servicing channel 0 cannot hold channel 3 driven.
+// GPIO in a first pass, BEFORE the first I2C write of the second pass.
+//
+// The FIRST failed write ends the call: all eight direction inputs are driven
+// LOW right then -- channels written earlier in this call included -- and no
+// further write is attempted. Nothing that runs after this function (the rear
+// sensor poll, GPS, the next pass) can find a channel still driven.
+//
+// It is recorded as a drive loss (gLostWhileLive) if output was live at the
+// failure (writeChannel() has already checked that) OR this call was asking
+// for any non-zero speed: a motion request that failed is a loss whichever
+// transaction failed, including the very first one from rest. A call whose
+// targets are all zero, with nothing live, is a pure stop -- a failure there
+// is a bus fault, not a lost motion request, and is not recorded.
 static void applyChannelSpeeds(const int speeds[MOTOR_CHANNEL_COUNT])
 {
     for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
@@ -194,8 +249,21 @@ static void applyChannelSpeeds(const int speeds[MOTOR_CHANNEL_COUNT])
         }
     }
     for (int i = 0; i < MOTOR_CHANNEL_COUNT; i++) {
-        writeChannel(&gMotors[i], speeds[i]);
+        if (!writeChannel(&gMotors[i], speeds[i])) {
+            for (int k = 0; k < MOTOR_CHANNEL_COUNT; k++) {
+                if (speeds[k] != 0) gLostWhileLive = true;
+            }
+            cutAllDirections();
+            return;
+        }
     }
+}
+
+bool motorConsumeLostWhileLive(void)
+{
+    bool lost = gLostWhileLive;
+    gLostWhileLive = false;
+    return lost;
 }
 
 
@@ -232,7 +300,9 @@ void motorInit(void)
 
         pinMode(gMotors[i].pinIn2, OUTPUT);
         digitalWrite(gMotors[i].pinIn2, LOW);
+        gDir[i] = 0;
     }
+    gLostWhileLive = false;             // no motion has been lost this boot
 
     // Step 2 - bring up the enable source. Returns false when the address is
     // unconfirmed or the chip is absent; that is reported, not worked around.
@@ -251,6 +321,19 @@ bool motorDriveAvailable(void)
 const char *motorDriveStatusName(void)
 {
     return pca9685StatusName();
+}
+
+bool motorDriveRecoveryService(void)
+{
+    if (!pca9685ServiceRecovery()) {
+        return false;
+    }
+
+    // Belt and braces, as in motorInit(): the bring-up already forced every
+    // output full-off; this also re-zeroes each enable channel and re-asserts
+    // every direction input LOW through the now-working chip.
+    stopMotors();
+    return true;
 }
 
 

@@ -58,7 +58,8 @@
 //         TURN. The enable inputs of both L298N boards are fed from this chip,
 //         so without a verified one there is no speed path at all. Telemetry
 //         reports "motor_drive_available":false and the state is
-//         DRIVE_UNAVAILABLE.
+//         DRIVE_UNAVAILABLE. (With the address confirmed, a chip that fails
+//         at boot or on a write is retried at runtime -- loop() step 3b.)
 //     Find both with {"cmd":"I2CSCAN"}, then {"cmd":"TCATEST"} / PCATEST.
 //  2. MOTOR MAP UNVERIFIED. The left/right grouping and rotation polarity in
 //     config.h are a placeholder assumption until confirmed with the
@@ -229,6 +230,26 @@ void loop()
     // ------------------------------------------------------------------
     commPoll();
     commLoopMark("COMM_RX");
+
+    // ------------------------------------------------------------------
+    // 3b. NO SPEED PATH: DISCARD, THEN TRY TO RECOVER
+    //     While the PCA9685 is not ready, every stored motion request is
+    //     discarded, a running MOTORTEST is cancelled, and a drive loss
+    //     (recorded by the motor layer at the failed write, when it also cut
+    //     all eight direction inputs) is latched into safety_stop -- all
+    //     FIRST. Only then is a bring-up retried, on its own backoff
+    //     schedule. So a drive that comes back -- even in this very pass --
+    //     starts at 0/0; after a drive loss it moves only once a RESET
+    //     received after the recovery has been reported for ACK_SETTLE_MS
+    //     has acknowledged it, and then only on a brand-new command. The
+    //     outage handled here restarts that settle period. Every attempt
+    //     runs with all wheels stopped.
+    //     Its time is reported under the MOTOR section of DIAG SYSTEM.
+    // ------------------------------------------------------------------
+    if (!motorDriveAvailable()) {
+        commDiscardMotionNoDrive();
+        (void)motorDriveRecoveryService();
+    }
 
     // ------------------------------------------------------------------
     // 4. COMMISSIONING OVERRIDE

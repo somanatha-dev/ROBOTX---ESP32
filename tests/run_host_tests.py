@@ -41,6 +41,13 @@
                            a fake sensor whose VCSEL period read fails
                            (tests/host/test_vl53_guard.cpp). An unpatched
                            library crashes this test with a divide-by-zero.
+7. PCA9685 recovery      -- the REAL sketch AND the real pca9685.cpp (every other
+                           suite stubs it) against a register-level fake PCA9685
+                           on a manual clock (tests/host/test_pca_recovery.cpp):
+                           boot NOT_FOUND / INIT_FAILED, read-back check,
+                           transient / persistent / hung-bus errors, backoff,
+                           and that no recovery energises a wheel, resumes an
+                           old request or MOTORTEST, or clears a latch.
 
 Build output goes to a temporary directory, never into the repository.
 """
@@ -142,6 +149,13 @@ def main():
             return 1
         motion_builds.append(exe_path)
 
+    pca = os.path.join(args.build_dir, "test_pca_recovery" + exe)
+    if run([args.cxx, *flags, '-DFW_BUILD_ID="harness-build"', '-DFW_BUILD_UTC="harness-utc"',
+            "-I", os.path.join(HERE, "host", "stubs"), "-I", ROOT,
+            os.path.join(HERE, "host", "test_pca_recovery.cpp"),
+            *[os.path.join(ROOT, f) for f in FIRMWARE + ["pca9685.cpp"]], "-o", pca]):
+        return 1
+
     rear_builds = []
     for name, defines in (("test_rear_tof", []),
                           ("test_rear_tof_runtime_reinit", ["-DREAR_TOF_RUNTIME_REINIT=1"])):
@@ -174,6 +188,7 @@ def main():
         failures += run([rear]) != 0
     for motion in motion_builds:
         failures += run([motion]) != 0
+    failures += run([pca]) != 0
     failures += run([gps]) != 0
     failures += run([vl53]) != 0
     front_file = os.path.join(args.build_dir, "sim_front_cm.txt")

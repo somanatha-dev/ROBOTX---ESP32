@@ -53,7 +53,8 @@ void motorInit(void);
 
 // ---------------------------------------------------------------------------
 // True only when the speed path is real: the PCA9685 address is confirmed, the
-// chip answered, and no bus error has been latched since.
+// chip answered, and no bus error has been latched since its last successful
+// bring-up (boot, or motorDriveRecoveryService()).
 //
 // Telemetry publishes this, and the Pi should refuse to drive without it.
 // ---------------------------------------------------------------------------
@@ -62,6 +63,26 @@ bool motorDriveAvailable(void);
 // Why motion is unavailable, for telemetry. Mirrors pca9685StatusName():
 //   "OK" / "ADDRESS_UNCONFIRMED" / "NOT_FOUND" / "INIT_FAILED" / "BUS_ERROR"
 const char *motorDriveStatusName(void);
+
+// ---------------------------------------------------------------------------
+// Try to get the speed path back while motorDriveAvailable() is false (see
+// pca9685ServiceRecovery()). On the call that succeeds, all four channels are
+// stopped again through the now-working chip, so the drive comes back at
+// 0/0. The CALLER must have discarded every stored motion request first.
+// Returns true on that call only.
+// ---------------------------------------------------------------------------
+bool motorDriveRecoveryService(void);
+
+// ---------------------------------------------------------------------------
+// Was motion lost to a failed PCA9685 enable write -- output LIVE at that
+// instant (any direction input driven), or the failing call asking for any
+// non-zero speed? A pure stop with nothing live is not recorded. Recorded by
+// the motor layer the moment the write fails; returns it and clears it
+// (consume once). comm.cpp turns a true into the safety_stop latch and an
+// acknowledgement requirement. When any enable write fails, all eight
+// direction inputs are already LOW by the time the motor call returns.
+// ---------------------------------------------------------------------------
+bool motorConsumeLostWhileLive(void);
 
 // ---------------------------------------------------------------------------
 // Primary motion API. DIFFERENTIAL DRIVE -- there is no steering input.

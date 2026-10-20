@@ -203,6 +203,26 @@
 // PCA9685 resolution is fixed at 12 bits by the part.
 #define PCA9685_PWM_MAX             4095
 
+// Runtime recovery of the PCA9685 (pca9685.cpp "RUNTIME RECOVERY").
+//
+// Previously a PCA9685 that did not answer during setup() -- seen on this
+// rover when the peripherals powered up ~4-5 s after the ESP32 (2026-10-02,
+// 10-19) -- or one failed enable write while running, left the drive
+// unavailable until the next reset. Now, while the drive is unavailable, the
+// full boot bring-up is retried: first INITIAL ms after the loss, then with
+// the interval doubling up to MAX. Every attempt happens with all wheels
+// stopped and every stored motion request already discarded.
+//
+// On a HUNG bus one attempt can block loop() for >= 1 s (core 2.0.14 waits at
+// least 1 s for a hung transaction, whatever I2C_TIMEOUT_MS says), so MAX
+// bounds that to one ~1 s stall per 30 s while the fault lasts.
+#define PCA9685_RECOVERY_INITIAL_MS 1000UL
+#define PCA9685_RECOVERY_MAX_MS     30000UL
+
+static_assert(PCA9685_RECOVERY_INITIAL_MS > 0 &&
+              PCA9685_RECOVERY_INITIAL_MS <= PCA9685_RECOVERY_MAX_MS,
+              "PCA9685 recovery: 0 < INITIAL <= MAX");
+
 // Motor enable channels. CONFIRMED by the operator.
 //   FRONT L298N: ENA <- CH0 (gates IN1/IN2), ENB <- CH1 (gates IN3/IN4)
 //   REAR  L298N: ENA <- CH2 (gates IN1/IN2), ENB <- CH3 (gates IN3/IN4)
@@ -830,6 +850,9 @@ static_assert(US_MIN_GOOD_SAMPLES <= US_SAMPLE_WINDOW,
 //   1          : yes. Motion can never resume without a brand-new command.
 //                Note this also defeats COMPONENT gating, because the stored
 //                command becomes (0,0) after the first blocked pass.
+// This switch covers the SAFETY gates only. A command gated because there is
+// no ready PCA9685 (MOTOR_PWM_UNAVAILABLE) is ALWAYS discarded, whatever it
+// says: the drive can be recovered at runtime, and must then start at 0/0.
 #define SAFETY_CLEAR_COMMAND_ON_BLOCK 1
 
 
@@ -910,6 +933,29 @@ static_assert(SERIAL_TX_BUFFER_BYTES > COMM_TX_FRAME_MAX,
 // ("Bandwidth"). Do NOT raise the baud rate: it is part of the Pi contract.
 #define TELEMETRY_INTERVAL_MS        200UL
 #define TELEMETRY_DIAG_EVERY_N_FAST  2
+
+// Drive-loss acknowledgement settle window (comm.cpp, "DRIVE LOSS ->
+// SAFETY-STOP LATCH"). After a drive loss, a RESET acknowledges it only if it
+// was received after a TELEMETRY report queued once the drive had been
+// available -- and reported available -- CONTINUOUSLY for this long.
+//
+// Why a settle period rather than the first report: the ESP32 can only see
+// when a report is QUEUED and when a byte reaches its RX ring buffer. The Pi
+// gets a report ~50-130 ms after it is queued (wire time, any frame ahead of
+// it, its read timeout), and a frame still arriving can sit uncounted in the
+// UART hardware FIFO for its whole length (core 2.0.14 at 115200: FIFO-full
+// 120 bytes, RX timeout 2 symbols). A RESET sent before the Pi saw the drive
+// come back reaches the ESP32 well inside this window and is excluded.
+// ASSUMPTION (not proven): the Pi takes less than about this long minus
+// ~200 ms between receiving a report and its RESET reaching the ESP32.
+// Any outage restarts the period.
+#define ACK_SETTLE_MS                1000UL
+
+static_assert(ACK_SETTLE_MS >= 5 * TELEMETRY_INTERVAL_MS,
+              "ACK_SETTLE_MS must cover several TELEMETRY reports and the Pi's "
+              "report-to-RESET latency");
+static_assert(ACK_SETTLE_MS <= 60000UL,
+              "ACK_SETTLE_MS longer than a minute would make acknowledgement impractical");
 
 // A loop() pass at least this long is recorded as a stall in DIAG SYSTEM
 // (last_stall_ms / last_stall_source / stall_count). A normal pass takes a few
@@ -1012,8 +1058,12 @@ static_assert(SERIAL_TX_BUFFER_BYTES > COMM_TX_FRAME_MAX,
 // never get stuck reporting SAFETY_STOP long after the obstacle has gone.
 //
 // The STICKY record of "a safety stop happened" is a SEPARATE latched boolean
-// published as "safety_stop", cleared only by RESET or a new accepted
-// movement command.
+// published as "safety_stop": set by a safety-gate clamp or by a drive loss
+// (a failed PCA9685 write while output was live or a non-zero speed was being
+// written), cleared only by RESET or a new accepted movement command -- and a
+// drive loss only by a RESET received after the recovered drive has been
+// reported available continuously for ACK_SETTLE_MS
+// (comm.h, "SAFETY-STOP LATCH").
 // ============================================================================
 
 // ---------------------------------------------------------------------------

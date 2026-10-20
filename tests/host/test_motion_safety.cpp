@@ -255,6 +255,16 @@ bool pca9685ProbeCandidate(uint8_t address, uint8_t *mode1Out, uint8_t *prescale
     return false;
 }
 
+// Runtime recovery never succeeds here, so a latched BUS_ERROR stays latched
+// (what A8 / B2 rely on). The real recovery is tested in test_pca_recovery.cpp.
+bool        pca9685ServiceRecovery(void)  { return false; }
+const char *pca9685RecoveryName(void)     { return gPcaBusErr ? "RETRYING" : "NONE"; }
+const char *pca9685LastFaultName(void)    { return gPcaBusErr ? "RUNTIME_BUS" : "NONE"; }
+uint16_t    pca9685RecoveryAttempts(void) { return 0; }
+uint16_t    pca9685Recoveries(void)       { return 0; }
+uint16_t    pca9685RuntimeBusErrors(void) { return gPcaBusErr ? 1 : 0; }
+uint32_t    pca9685NextRetryInMs(void)    { return 0; }
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -518,9 +528,41 @@ static void testA_pcaFailure(void)
     startDriving(150, 150);
     size_t from = gLog.size();
     gPcaFailCh = kEnableCh[2];               // the bus starts failing
-    pass(5);
+    pass(1);
+    // Channels 0 and 1 were rewritten (driven) earlier in this very pass: they
+    // must be cut by the motor layer now, not by the next pass.
+    CHECK(motorPinsAllLow(), "channels written before the failed one were not cut in the failing pass");
+
+    // The failing pass is a DRIVING pass (it legitimately rewrites directions
+    // and duties before the failure), so the stop-pass rule does not apply to
+    // it. What must hold: after the failed write, no further PCA operation and
+    // no direction pin driven HIGH until every direction pin is LOW.
+    int level[64];
+    for (int i = 0; i < 64; i++) level[i] = LOW;
+    size_t failAt = gLog.size();
+    for (size_t e = 0; e < gLog.size(); e++) {
+        if (e >= from && gLog[e].kind == EV_DUTY && gLog[e].b == -1) { failAt = e; break; }
+        if (gLog[e].kind == EV_GPIO) level[gLog[e].a] = gLog[e].b;
+    }
+    CHECK(failAt < gLog.size(), "harness: the failed write was not logged");
+    bool allLow = false, pcaBeforeCut = false, highAfterFail = false;
+    for (size_t e = failAt + 1; e < gLog.size() && !allLow; e++) {
+        const Ev &ev = gLog[e];
+        if (ev.kind == EV_GPIO) {
+            if (ev.b == HIGH) highAfterFail = true;
+            level[ev.a] = ev.b;
+            allLow = true;
+            for (int p = 0; p < 8; p++) if (level[kMotorPins[p]] != LOW) allLow = false;
+        } else if (ev.kind == EV_DUTY || ev.kind == EV_ALLOFF) {
+            pcaBeforeCut = true;
+        }
+    }
+    CHECK(allLow, "direction pins never all LOW after the failed write");
+    CHECK(!pcaBeforeCut, "a PCA9685 operation ran after the failed write, before the cut");
+    CHECK(!highAfterFail, "a direction pin was driven HIGH after the failed write");
+
+    pass(4);
     CHECK(!motorDriveAvailable(), "PCA failure did not make drive unavailable");
-    checkStopPass(from, "PCA9685 bus error");
     CHECK(motorPinsAllLow(), "direction pins not LOW after a PCA failure");
 }
 

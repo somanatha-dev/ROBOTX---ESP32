@@ -175,8 +175,12 @@ def t01_valid_drive(ctx):
     f = ctx.cmd("DRIVE", left=150, right=150)
     expect_motion(ctx, f, "DRIVE", 150, 150)
     tel = ctx.telemetry()
-    want = (0, 0) if (CLEAR_ON_BLOCK and f["result"] == "GATED"
-                      and f["reason"] != "MOTOR_PWM_UNAVAILABLE") else (150, 150)
+    # A gated command is discarded: always for MOTOR_PWM_UNAVAILABLE (the drive
+    # can be recovered at runtime and must not then act on an old request),
+    # and for the safety gates when CLEAR_ON_BLOCK.
+    discarded = f["result"] == "GATED" and (
+        CLEAR_ON_BLOCK or f["reason"] == "MOTOR_PWM_UNAVAILABLE")
+    want = (0, 0) if discarded else (150, 150)
     check((tel["left_cmd"], tel["right_cmd"]) == want, f"telemetry left_cmd (want {want}): {tel}")
     check((tel["left_applied"], tel["right_applied"]) ==
           (f["applied_left"], f["applied_right"]), "telemetry applied != ack applied")
@@ -422,7 +426,11 @@ def t13_duplicate(ctx):
     # Same seq, different content: still a duplicate, and NOT executed.
     dup2 = ack(ctx.frame_for(command(s, "STOP"), s), result="DUPLICATE")
     check(dup2["cmd"] == "STOP" and dup2["original_cmd"] == "DRIVE", f"{dup2}")
-    check(ctx.telemetry()["left_cmd"] == v, "a duplicate seq was executed")
+    # Without a drive the DRIVE itself is discarded (MOTOR_PWM_UNAVAILABLE), so
+    # left_cmd cannot tell an executed STOP apart there; the ACKs above still
+    # prove the duplicate was not executed, and runs with a drive check this.
+    if ctx.last_tel["motor_drive_available"]:
+        check(ctx.telemetry()["left_cmd"] == v, "a duplicate seq was executed")
     ctx.stop()
 
     # Replay of an OLDER frame after another command: stale, not executed.

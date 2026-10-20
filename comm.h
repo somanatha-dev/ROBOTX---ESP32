@@ -99,6 +99,20 @@ int  commDesiredRight(void);
 void commClearDesired(void);
 
 // ---------------------------------------------------------------------------
+// The speed path is unavailable (no ready PCA9685). Called by loop() on every
+// such pass, BEFORE any recovery attempt, so a drive that comes back can never
+// act on a request made before it was lost:
+//   * the stored request is zeroed and a running MOTORTEST is CANCELLED;
+//   * a pending drive-loss record from the motor layer is turned into the
+//     safety-stop latch and an acknowledgement requirement (see the
+//     SAFETY-STOP LATCH note below);
+//   * any earlier report of the drive being available is voided, so an
+//     acknowledgement must follow a report made after it comes back.
+// The watchdog and its timeout latch are not touched.
+// ---------------------------------------------------------------------------
+void commDiscardMotionNoDrive(void);
+
+// ---------------------------------------------------------------------------
 // Per-pass runtime update, called by loop() AFTER the safety gate has run,
 // with the GATED values -- what the safety and availability gates permitted.
 // Records them, derives what the motor layer actually outputs from them
@@ -148,8 +162,29 @@ RobotState commGetState(void);
 // command timeout would otherwise erase the fact that a safety stop ever
 // happened, and the Pi would lose the reason the rover halted.
 //
+// It is SET by:
+//   * a safety gate clamping a command (obstacle, sensor fault, or the
+//     REAR_UNCONFIGURED policy) -- in loop() and in the command handler;
+//   * a DRIVE LOSS: a PCA9685 enable write failing while output was live (any
+//     direction input driven at that instant) or while a non-zero speed was
+//     being written. The motor layer records that at the failure itself
+//     (motorConsumeLostWhileLive()) and comm.cpp latches it before handling
+//     any further command, runtime update or telemetry, so a command arriving
+//     during a hung write cannot erase it. Runtime recovery of the PCA9685
+//     never clears it.
+//
 // The latch is cleared ONLY by a fully-unclamped accepted movement command or
 // by RESET. It is never cleared merely because the obstacle went away.
+//
+// A DRIVE LOSS additionally needs ACKNOWLEDGING. Until then the latch is held,
+// DRIVE/MOVE are GATED and MOTORTEST REJECTED (reason
+// DRIVE_LOSS_UNACKNOWLEDGED), and RESET -- still ACCEPTED, still stopping the
+// motors and clearing the command timeout -- clears the latch only if the
+// drive is available and the RESET line began arriving after the settle
+// snapshot: a TELEMETRY report queued once the drive had been available, and
+// reported available, continuously for ACK_SETTLE_MS (config.h). Any outage
+// restarts that. A RESET sent while the drive was down, or within about
+// ACK_SETTLE_MS of it coming back, acknowledges nothing.
 // ---------------------------------------------------------------------------
 void commLatchSafetyStop(void);
 bool commSafetyStopLatched(void);

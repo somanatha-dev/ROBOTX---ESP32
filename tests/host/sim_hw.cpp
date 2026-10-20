@@ -346,6 +346,17 @@ bool pca9685SetDuty(uint8_t ch, uint16_t duty)
 }
 bool        pca9685AllOff(void)           { return gDriveAvailable; }
 
+// Runtime recovery: the simulated chip is either always there or never (it is
+// unconfirmed), so there is never anything to recover. The real logic is
+// covered by tests/host/test_pca_recovery.cpp against the real pca9685.cpp.
+bool        pca9685ServiceRecovery(void)  { return false; }
+const char *pca9685RecoveryName(void)     { return "NONE"; }
+const char *pca9685LastFaultName(void)    { return "NONE"; }
+uint16_t    pca9685RecoveryAttempts(void) { return 0; }
+uint16_t    pca9685Recoveries(void)       { return 0; }
+uint16_t    pca9685RuntimeBusErrors(void) { return 0; }
+uint32_t    pca9685NextRetryInMs(void)    { return 0; }
+
 bool pca9685ProbeCandidate(uint8_t address, uint8_t *mode1Out, uint8_t *prescaleOut)
 {
     if (mode1Out)    *mode1Out    = 0;
