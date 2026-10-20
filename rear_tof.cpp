@@ -91,6 +91,14 @@ static uint32_t gNextPollMs  = 0;
 static bool     gBackendUp   = false;
 static bool     gReinitPermitted = true;    // see rearTofSetReinitPermitted()
 
+// Rear I2C backoff (see "REAR I2C BACKOFF" below and config.h).
+static bool     gBoActive        = false;   // no rear I2C until gBoRetryAtMs
+static uint32_t gBoRetryAtMs     = 0;
+static uint32_t gBoIntervalMs    = 0;       // last interval used; 0 = start at INITIAL
+static uint32_t gBoEntries       = 0;       // backoffs entered since boot
+static bool     gHealthyRun      = false;   // a clean visit since the last fault
+static uint32_t gHealthySinceMs  = 0;
+
 
 // ============================================================================
 // SMALL HELPERS
@@ -260,6 +268,13 @@ bool rearTofInit(void)
     gActive     = 0;
     gNextPollMs = millis();
     gBackendUp  = false;
+
+    gBoActive       = false;
+    gBoRetryAtMs    = 0;
+    gBoIntervalMs   = 0;
+    gBoEntries      = 0;
+    gHealthyRun     = false;
+    gHealthySinceMs = 0;
 
     static const uint8_t channelOf[REAR_TOF_SENSOR_COUNT] = {
         TCA_CH_REAR_TOF_0,
@@ -458,13 +473,91 @@ static void demoteForReinit(RearTofSensor *s)
 #endif
 
 
+// ============================================================================
+// REAR I2C BACKOFF
+// ============================================================================
+//
+// Without this, a TCA9548A select that hangs (>= 1 s on core 2.0.14) was
+// retried on the very next 20 ms poll: on 2026-09-25 that stalled EVERY loop
+// pass ~1022 ms for 53 minutes. Now a failed select or deselect, or any rear
+// transaction slower than REAR_I2C_SLOW_MS, suspends ALL rear I2C for
+// REAR_I2C_BACKOFF_INITIAL_MS, doubling on each further fault up to
+// REAR_I2C_BACKOFF_MAX_MS. After REAR_I2C_BACKOFF_HEALTHY_RESET_MS of clean
+// visits the next fault starts again from INITIAL.
+//
+// While suspended: no rear transaction at all, and every sensor's validity is
+// re-derived from RAM on every pass (refreshValidity()), so readings expire on
+// the normal REAR_TOF_STALE_MS schedule -- the rear reads as REAR_SENSOR_FAULT,
+// reverse stays blocked, and nothing stale is reported. Forward motion does
+// not use rear data and is untouched. The first retry is one ordinary visit;
+// if it is clean, sensing simply resumes (sensors need fresh samples to be
+// valid again). Nothing here touches a motor or a stored command.
+//
+// This bounds how OFTEN a hung transaction can stall loop(); it cannot shorten
+// one -- that is the loop-stall guard's job (stall_guard.h).
+// ============================================================================
+
+static void refreshAllValidity(void)
+{
+    for (uint8_t i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        refreshValidity(&gTof[i]);
+    }
+}
+
+static void enterRearBackoff(void)
+{
+    uint32_t now = millis();                 // after the failing transaction
+
+    if (gHealthyRun && (uint32_t)(now - gHealthySinceMs) >= REAR_I2C_BACKOFF_HEALTHY_RESET_MS) {
+        gBoIntervalMs = 0;                   // long healthy run: start over
+    }
+
+    if (gBoIntervalMs == 0) {
+        gBoIntervalMs = REAR_I2C_BACKOFF_INITIAL_MS;
+    } else if (gBoIntervalMs >= REAR_I2C_BACKOFF_MAX_MS / 2) {
+        gBoIntervalMs = REAR_I2C_BACKOFF_MAX_MS;
+    } else {
+        gBoIntervalMs *= 2;
+    }
+
+    gBoActive    = true;
+    gBoRetryAtMs = now + gBoIntervalMs;
+    gHealthyRun  = false;
+    if (gBoEntries < 0xFFFFFFFFUL) gBoEntries++;
+
+    refreshAllValidity();
+}
+
+static void noteRearVisitClean(void)
+{
+    if (!gHealthyRun) {
+        gHealthyRun     = true;
+        gHealthySinceMs = millis();
+    }
+}
+
+static bool slowSince(uint32_t startMs)
+{
+    return (uint32_t)(millis() - startMs) > REAR_I2C_SLOW_MS;
+}
+
 void rearTofUpdate(void)
 {
     if (!tcaAddressConfirmed() || !tcaPresent()) {
         return;                     // nothing legitimate to talk to
     }
 
-    // Signed comparison handles millis() rollover correctly.
+    // Backing off: no rear I2C, validity decays from RAM. Signed comparison
+    // handles millis() rollover correctly.
+    if (gBoActive) {
+        if ((int32_t)(millis() - gBoRetryAtMs) < 0) {
+            refreshAllValidity();
+            return;
+        }
+        gBoActive   = false;        // retry: one ordinary visit, right now
+        gNextPollMs = millis();
+    }
+
     if ((int32_t)(millis() - gNextPollMs) < 0) {
         return;
     }
@@ -473,6 +566,9 @@ void rearTofUpdate(void)
 
     gActive     = (uint8_t)((gActive + 1) % REAR_TOF_SENSOR_COUNT);
     gNextPollMs = millis() + REAR_TOF_POLL_INTERVAL_MS;
+
+    bool     busFault = false;      // select / deselect failed, or any txn slow
+    uint32_t t0       = millis();
 
     if (!tcaSelectChannel(s->channel)) {
         // We do not know which segment is connected. Abandoning is the only
@@ -483,13 +579,16 @@ void rearTofUpdate(void)
         // sensor, and re-initialising the VL53L0X cannot repair it.
         recordBusError(s, TOF_BUSERR_TCA_SELECT, roverI2cLastError());
         refreshValidity(s);
+        enterRearBackoff();
         return;
     }
+    busFault = slowSince(t0);
 
     if (s->initialised) {
         // Consecutive VL53L0X-transaction BUS_ERRORs only. Any visit where
         // the sensor answered -- not ready, TIMEOUT, OUT_OF_RANGE, VALID --
         // breaks the run.
+        uint32_t t1 = millis();
         if (serviceSelected(s)) {
             if (s->busErrStreak < 0xFFFF) {
                 s->busErrStreak++;
@@ -497,6 +596,7 @@ void rearTofUpdate(void)
         } else {
             s->busErrStreak = 0;
         }
+        busFault = busFault || slowSince(t1);
 
 #if REAR_TOF_REINIT_AFTER_MS > 0
         if (s->busErrStreak >= REAR_TOF_BUS_ERROR_REINIT_STREAK) {
@@ -534,9 +634,18 @@ void rearTofUpdate(void)
     // Back to the main segment. Keeping the default "no channel open" means
     // any code path that forgets to select cannot accidentally succeed against
     // whichever sensor happened to still be connected.
-    (void)tcaDeselectAll();
+    uint32_t t2 = millis();
+    if (!tcaDeselectAll() || slowSince(t2)) {
+        busFault = true;
+    }
 
     refreshValidity(s);
+
+    if (busFault) {
+        enterRearBackoff();
+    } else {
+        noteRearVisitClean();
+    }
 
     // STICKY FOR THE REST OF THIS BOOT. "Backend up" means the rear backend
     // came up at least once since rearTofInit() -- NOT "some sensor is
@@ -616,6 +725,17 @@ bool rearTofBackendAvailable(void)
 void rearTofSetReinitPermitted(bool permitted)
 {
     gReinitPermitted = permitted;
+}
+
+bool     rearTofI2cBackoffActive(void)     { return gBoActive;     }
+uint32_t rearTofI2cBackoffIntervalMs(void) { return gBoIntervalMs; }
+uint32_t rearTofI2cBackoffEntries(void)    { return gBoEntries;    }
+
+uint32_t rearTofI2cBackoffRemainingMs(void)
+{
+    if (!gBoActive) return 0;
+    int32_t left = (int32_t)(gBoRetryAtMs - millis());
+    return (left > 0) ? (uint32_t)left : 0;
 }
 
 bool rearTofAnyValid(void)

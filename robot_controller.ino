@@ -94,10 +94,21 @@
 #include "pca9685.h"
 #include "rear_tof.h"
 #include "gps.h"
+#include "stall_guard.h"
 
 
 void setup()
 {
+    // ------------------------------------------------------------------
+    // 0. LOOP-STALL GUARD TASK (core 0), started but NOT ARMED: everything
+    //    in setup() may legitimately block (VL53L0X init, the bus scan).
+    //    It is armed as the very last step below. Started first, and its
+    //    first tick awaited (bounded), so that motorDriveAvailable() -- which
+    //    requires it to be ticking -- is true from the start and READY
+    //    reports the real state.
+    // ------------------------------------------------------------------
+    stallGuardBegin();
+
     // ------------------------------------------------------------------
     // 1. I2C FIRST.
     //    Both the motor enable source (PCA9685) and the rear sensors live on
@@ -180,6 +191,13 @@ void setup()
 #if I2C_BOOT_SCAN
     commBootI2cScan();
 #endif
+
+    // ------------------------------------------------------------------
+    // 6. ARM THE LOOP-STALL GUARD. From here on, a loop() that makes no
+    //    progress for STALL_GUARD_T_STALL_MS while a motor direction input
+    //    is HIGH has all eight cut LOW by the guard task (stall_guard.h).
+    // ------------------------------------------------------------------
+    stallGuardArm();
 }
 
 
@@ -207,7 +225,9 @@ void loop()
     //    per REAR_TOF_POLL_INTERVAL_MS, round-robin across the three sensors,
     //    each behind its own TCA channel. The sensors run in continuous mode,
     //    so this never waits for a measurement. It is a no-op while the
-    //    TCA9548A address is unconfirmed.
+    //    TCA9548A address is unconfirmed, and while the rear I2C backoff is
+    //    active (a failed or slow TCA/VL53L0X step: 1 s doubling to 30 s,
+    //    validity still expiring meanwhile -- rear_tof.cpp).
     //
     //    A failed rear sensor is NOT re-initialised from here (RX-01): the
     //    VL53L0X library's init() can block for seconds and nothing can cut

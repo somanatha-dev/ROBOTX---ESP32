@@ -603,6 +603,41 @@ static_assert(PCA9685_RECOVERY_INITIAL_MS > 0 &&
 // A sensor with no good reading for this long is FAULTY, not "clear".
 #define REAR_TOF_STALE_MS           600UL
 
+// Rear I2C backoff (rear_tof.cpp "REAR I2C BACKOFF").
+//
+// A failed TCA9548A channel select or deselect, or ANY rear step slower than
+// REAR_I2C_SLOW_MS -- the TCA select, the VL53L0X read sequence (up to three
+// transactions: ready register, range status, range) or the TCA deselect --
+// suspends ALL rear I2C: first for INITIAL, doubling up to
+// MAX while it keeps failing. While suspended no rear transaction is
+// attempted at all, and every sensor's validity keeps expiring from RAM by
+// REAR_TOF_STALE_MS -- so reverse is blocked (REAR_SENSOR_FAULT) and nothing
+// stale is reported. After HEALTHY_RESET of uninterrupted healthy visits the
+// next fault starts again from INITIAL.
+//
+// Evidence: on 2026-09-25 a hung TCA select stalled every loop pass ~1022 ms
+// for 53 minutes, because the poll retried it every pass. Backoff limits how
+// OFTEN that can happen; it cannot shorten one hung transaction (core 2.0.14
+// waits >= 1 s whatever I2C_TIMEOUT_MS says).
+//
+// A VL53L0X that fails FAST (answers with a NACK in ~ms) is not this case: it
+// costs the loop nothing and keeps its own bound -- demoted after
+// REAR_TOF_BUS_ERROR_REINIT_STREAK visits in a row, then never polled again
+// this boot -- without blinding the other two sensors.
+//
+// REAR_I2C_SLOW_MS: one normal transaction is well under 2 ms at 100 kHz, and
+// the range read is only issued once the sensor reports data ready.
+#define REAR_I2C_BACKOFF_INITIAL_MS     1000UL
+#define REAR_I2C_BACKOFF_MAX_MS         30000UL
+#define REAR_I2C_BACKOFF_HEALTHY_RESET_MS 30000UL
+#define REAR_I2C_SLOW_MS                50UL
+
+static_assert(REAR_I2C_BACKOFF_INITIAL_MS > 0 &&
+              REAR_I2C_BACKOFF_INITIAL_MS <= REAR_I2C_BACKOFF_MAX_MS,
+              "rear I2C backoff: 0 < INITIAL <= MAX");
+static_assert(REAR_I2C_SLOW_MS < 1000UL,
+              "REAR_I2C_SLOW_MS must be below the 1 s hung-transaction floor");
+
 // Health streaks, mirroring the HC-SR04 policy. At 3 sensors x 20 ms one
 // sensor is serviced every 60 ms, so 3 is ~180 ms and 8 is ~480 ms.
 #define REAR_TOF_HEALTH_DEGRADED_STREAK 3
@@ -956,6 +991,50 @@ static_assert(ACK_SETTLE_MS >= 5 * TELEMETRY_INTERVAL_MS,
               "report-to-RESET latency");
 static_assert(ACK_SETTLE_MS <= 60000UL,
               "ACK_SETTLE_MS longer than a minute would make acknowledgement impractical");
+
+// Loop-stall guard (stall_guard.cpp). A task on core 0 checks every PERIOD
+// that loop() has made progress within T_STALL; if not, and any motor
+// direction input is HIGH, it drives all eight LOW and latches a drive loss.
+//
+// *** T_STALL IS A PROVISIONAL HOST-TEST VALUE, NOT A VALIDATED REQUIREMENT. ***
+// It must exceed the longest LEGITIMATE gap between two loop-progress
+// markers while the motors are driven. From the source (never measured on
+// the rover): one HC-SR04 pulseIn() busy-waits <= US_ECHO_TIMEOUT_US (20 ms)
+// plus one rear poll (~2 ms) in the same section; one GPS pass reads <= 128
+// bytes (~16 ms); 8 PCA9685 writes ~5 ms. So ~25 ms per section, ~45 ms per
+// pass. 100 ms leaves ~4x margin and is shorter than a hung transaction
+// (>= 1000 ms). Measure DIAG SYSTEM loop_max_ms on the rover, on blocks,
+// before trusting it -- and make the stop-latency requirement an explicit
+// engineering decision.
+//
+// The guard BRAKES (L298N inputs both LOW); it does not remove bridge power
+// or touch the PCA9685 enables. It is software on the same chip.
+#define STALL_GUARD_T_STALL_MS          100UL
+#define STALL_GUARD_PERIOD_MS           10UL
+#define STALL_GUARD_TASK_PRIORITY       20       // FreeRTOS, core 0 (max 24 on ESP32)
+#define STALL_GUARD_TASK_STACK_BYTES    2048
+
+static_assert(STALL_GUARD_PERIOD_MS > 0 &&
+              STALL_GUARD_T_STALL_MS >= 5 * STALL_GUARD_PERIOD_MS,
+              "stall guard: T_STALL must span several guard periods");
+static_assert(STALL_GUARD_T_STALL_MS > 2 * (US_ECHO_TIMEOUT_US / 1000UL),
+              "stall guard: T_STALL must exceed a legitimate ultrasonic busy-wait with margin");
+static_assert(STALL_GUARD_T_STALL_MS < COMMAND_TIMEOUT_MS,
+              "stall guard: T_STALL must be shorter than the command watchdog");
+
+// Guard-task liveness. The task stamps millis() on every tick; the drive is
+// available only while the latest stamp is at most this old (and the task was
+// created), so a guard that stops ticking -- starved, suspended, blocked --
+// makes the drive unavailable instead of silently leaving it unprotected.
+// Ticks come every PERIOD (vTaskDelayUntil on the 1 kHz FreeRTOS tick; millis()
+// resolution 1 ms), so a healthy stamp is <= ~11 ms old: 50 ms tolerates four
+// consecutive late ticks, and is reached well before T_STALL.
+#define STALL_GUARD_LIVENESS_MS         50UL
+
+static_assert(STALL_GUARD_LIVENESS_MS > STALL_GUARD_PERIOD_MS,
+              "stall guard: the liveness window must exceed the tick interval");
+static_assert(STALL_GUARD_LIVENESS_MS < STALL_GUARD_T_STALL_MS,
+              "stall guard: the liveness window must be shorter than T_STALL");
 
 // A loop() pass at least this long is recorded as a stall in DIAG SYSTEM
 // (last_stall_ms / last_stall_source / stall_count). A normal pass takes a few

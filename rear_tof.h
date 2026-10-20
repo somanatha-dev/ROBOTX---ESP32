@@ -189,6 +189,13 @@ const char         *rearTofReinitResultName(RearTofReinitResult r);
 // False until a human confirms which sensor is physically left/centre/right.
 bool rearTofOrientationVerified(void);
 
+// Rear I2C backoff (config.h REAR_I2C_*): a failed TCA select/deselect or any
+// slow rear transaction suspends ALL rear I2C, 1 s doubling to 30 s.
+bool     rearTofI2cBackoffActive(void);
+uint32_t rearTofI2cBackoffRemainingMs(void);   // 0 when not backing off
+uint32_t rearTofI2cBackoffIntervalMs(void);    // the interval last used (0 = none)
+uint32_t rearTofI2cBackoffEntries(void);       // backoffs entered since boot
+
 // ---------------------------------------------------------------------------
 // COMMISSIONING: test ONE sensor, right now, synchronously.
 //

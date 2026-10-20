@@ -47,7 +47,11 @@
                            boot NOT_FOUND / INIT_FAILED, read-back check,
                            transient / persistent / hung-bus errors, backoff,
                            and that no recovery energises a wheel, resumes an
-                           old request or MOTORTEST, or clears a latch.
+                           old request or MOTORTEST, or clears a latch. Also
+                           the loop-stall guard (stall_guard.cpp), ticked by
+                           the fake clock inside simulated hung PCA9685 /
+                           TCA9548A / VL53L0X / GPS transactions.
+   (rear ToF also covers the rear I2C backoff: tests X..AE.)
 
 Build output goes to a temporary directory, never into the repository.
 """
@@ -62,7 +66,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 FIRMWARE = ["comm.cpp", "protocol.cpp", "motor.cpp", "safety.cpp", "rear_tof.cpp",
-            "tca9548a.cpp", "rover_i2c.cpp", "gps.cpp"]
+            "tca9548a.cpp", "rover_i2c.cpp", "gps.cpp", "stall_guard.cpp"]
 
 REAR_TOF = ["rear_tof.cpp", "safety.cpp", "tca9548a.cpp", "rover_i2c.cpp"]
 

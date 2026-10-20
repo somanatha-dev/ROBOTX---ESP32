@@ -11,6 +11,7 @@
 #include "rover_i2c.h"
 #include "tca9548a.h"
 #include "pca9685.h"
+#include "stall_guard.h"
 #include "gps.h"
 #include "config.h"
 
@@ -620,11 +621,22 @@ static void voidAckWindow(void)
     gLineAfterReport  = false;
 }
 
+static void endMotorTest(const char *why);
+
 static void absorbDriveLoss(void)
 {
     if (motorConsumeLostWhileLive()) {
         gLossUnacked = true;
         voidAckWindow();                // the ack must follow a settle after THIS loss
+
+        // A loss discards stored motion at once. After a PCA9685 failure
+        // loop() step 3b does this too, but a loop-stall guard trip can happen
+        // with the drive still available: a stored request left in place would
+        // be re-tried every pass, refused by the guard, and re-recorded as a
+        // fresh loss -- restarting the settle window for ever.
+        gDesiredLeft  = 0;
+        gDesiredRight = 0;
+        endMotorTest("CANCELLED");      // no-op unless one is running
     }
     if (gLossUnacked) {
         gSafetyStopLatched = true;
@@ -779,7 +791,7 @@ static void applyMotion(int left, int right)
     if (!motorDriveAvailable()) {
         gDesiredLeft  = 0;
         gDesiredRight = 0;
-        stopMotors();
+        motorStopUnavailable(left != 0 || right != 0);  // records a guard-down loss
         commUpdateRuntime(0, 0, "MOTOR_PWM_UNAVAILABLE");
         ackMotion("GATED", "MOTOR_PWM_UNAVAILABLE", left, right);
         return;
@@ -981,6 +993,7 @@ static bool validateMotorTest(int *motor, int *power, int *ms)
     // test that silently does nothing and leaves the operator concluding the
     // motor channel is dead.
     if (!motorDriveAvailable()) {
+        motorStopUnavailable(*power != 0);              // records a guard-down loss
         ackReject("MOTOR_PWM_UNAVAILABLE", NULL);
         return false;
     }
@@ -1065,6 +1078,7 @@ static void handleReset(void)
     if (!gLossUnacked || resetAcknowledgesLoss()) {
         gLossUnacked       = false;
         gSafetyStopLatched = false;
+        stallGuardClearTrip();          // a guard trip is a drive loss: same ack
     }
     gTimedOut          = false;
 
@@ -1988,6 +2002,12 @@ static void txDiagRear(void)
         tx("%s\"%s\"", i ? "," : "", rearTofReinitResultName(rearTofLastReinitResult(i)));
     }
     tx("]");
+
+    // Rear I2C backoff: ms until the next rear transaction (0 = not backing
+    // off) and how many backoffs since boot.
+    tx(",\"rear_i2c_backoff_ms\":%lu,\"rear_i2c_backoffs\":%lu",
+       (unsigned long)rearTofI2cBackoffRemainingMs(),
+       (unsigned long)rearTofI2cBackoffEntries());
 }
 
 // ============================================================================
@@ -2028,6 +2048,7 @@ static void noteSection(const char *source, uint32_t ms)
 
 void commLoopBegin(void)
 {
+    stallGuardHeartbeat();              // loop() progress, for the stall guard
     gPassStartMs    = millis();
     gSectionStartMs = gPassStartMs;
     gNestedMs       = 0;
@@ -2043,6 +2064,7 @@ void commLoopNested(const char *source, uint32_t ms)
 
 void commLoopMark(const char *source)
 {
+    stallGuardHeartbeat();              // loop() progress, for the stall guard
     uint32_t now     = millis();
     uint32_t elapsed = now - gSectionStartMs;
     noteSection(source, (elapsed > gNestedMs) ? (elapsed - gNestedMs) : 0);
@@ -2080,6 +2102,8 @@ static void txDiagSystem(void)
     txBool("tca_address_confirmed", tcaAddressConfirmed());
     txBool("pca_address_confirmed", pca9685AddressConfirmed());
     txStr("motor_drive_status", motorDriveStatusName());
+    txStr("stall_guard", stallGuardStateName());
+    tx(",\"stall_guard_trips\":%lu", (unsigned long)stallGuardTrips());
     txStr("pca_recovery", pca9685RecoveryName());
     txStr("pca_last_fault", pca9685LastFaultName());
     tx(",\"pca_recovery_attempts\":%u,\"pca_recoveries\":%u,"

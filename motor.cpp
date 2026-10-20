@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "motor.h"
 #include "pca9685.h"
+#include "stall_guard.h"
 #include "config.h"
 
 // ============================================================================
@@ -186,8 +187,27 @@ static void noteWriteFailure(void)
     }
 }
 
+// The loop-stall guard is not operational: never started, or its task has
+// stopped ticking (stallGuardOperational()). Nothing could then cut a stalled
+// loop's output, so output live right now -- or a non-zero request being
+// refused for it -- is a lost drive, recorded like a failed write. Called
+// BEFORE anything is cut, so a STOP or RESET processed meanwhile cannot erase
+// the evidence.
+static void noteGuardDown(bool motionRequested)
+{
+    if (stallGuardOperational()) {
+        return;
+    }
+    if (motionRequested) {
+        gLostWhileLive = true;
+        return;
+    }
+    noteWriteFailure();                 // any direction input driven?
+}
+
 // Returns false if a PCA9685 write for this channel failed (the failure has
-// been recorded; the caller cuts every channel).
+// been recorded; the caller cuts every channel), or if the loop-stall guard
+// has tripped and refused to raise its direction inputs.
 static bool writeChannel(const MotorChannel *m, int speed)
 {
     // ---- Stop: direction LOW first (GPIO), then the enable (I2C). ----
@@ -208,12 +228,17 @@ static bool writeChannel(const MotorChannel *m, int speed)
     }
 
     // ---- 2. Direction. ----
-    if (speed > 0) {
-        digitalWrite(m->pinIn1, HIGH);
-        digitalWrite(m->pinIn2, LOW);
-    } else {
-        digitalWrite(m->pinIn1, LOW);
-        digitalWrite(m->pinIn2, HIGH);
+    // THE ONLY direction-HIGH write in the firmware, and it goes through the
+    // stall guard: checked against the trip flag and written inside the same
+    // cross-core critical section the guard cuts in (stall_guard.h). If the
+    // guard has tripped -- e.g. while step 1 above was a hung I2C write that
+    // has only now returned -- nothing is raised.
+    bool raised = (speed > 0)
+                ? stallGuardSetDirection(m->pinIn1, HIGH, m->pinIn2, LOW)
+                : stallGuardSetDirection(m->pinIn1, LOW,  m->pinIn2, HIGH);
+    if (!raised) {
+        cutDirection(m);
+        return false;
     }
     gDir[channelIndexOf(m)] = (int8_t)signOf(speed);
 
@@ -261,7 +286,10 @@ static void applyChannelSpeeds(const int speeds[MOTOR_CHANNEL_COUNT])
 
 bool motorConsumeLostWhileLive(void)
 {
-    bool lost = gLostWhileLive;
+    // A loop-stall guard trip is a drive loss too: it only fires while a
+    // direction input is HIGH (stall_guard.cpp).
+    bool guardTrip = stallGuardConsumeTripEvidence();
+    bool lost      = gLostWhileLive || guardTrip;
     gLostWhileLive = false;
     return lost;
 }
@@ -315,12 +343,23 @@ void motorInit(void)
 
 bool motorDriveAvailable(void)
 {
-    return pca9685Ready();
+    // Fail closed: no loop-stall guard task ticking, no motion (a guard that
+    // never started, or has stopped, could not cut anything).
+    return pca9685Ready() && stallGuardOperational();
 }
 
 const char *motorDriveStatusName(void)
 {
+    if (!stallGuardOperational()) {
+        return "STALL_GUARD_NOT_RUNNING";
+    }
     return pca9685StatusName();
+}
+
+void motorStopUnavailable(bool motionRequested)
+{
+    noteGuardDown(motionRequested);
+    stopMotors();
 }
 
 bool motorDriveRecoveryService(void)
@@ -360,7 +399,7 @@ void driveDifferential(int leftSpeed, int rightSpeed)
     // half-speed mode and not a best-effort attempt: the chip that gates every
     // half-bridge has not been identified.
     if (!motorDriveAvailable()) {
-        stopMotors();
+        motorStopUnavailable(leftSpeed != 0 || rightSpeed != 0);
         return;
     }
 
@@ -383,6 +422,9 @@ void driveDifferential(int leftSpeed, int rightSpeed)
 
 void stopMotors(void)
 {
+    // 0. Evidence before the cut: live output with no guard running is a loss.
+    noteGuardDown(false);
+
     // 1. GPIO first: every direction input LOW, for all four channels, before
     //    anything touches the I2C bus (see "ONE CHANNEL" above). This part
     //    cannot be held up by a hung bus.
@@ -446,7 +488,7 @@ void turnRight(int speed)
 void motorDriveChannel(int channelIndex, int speed)
 {
     if (!motorDriveAvailable()) {
-        stopMotors();
+        motorStopUnavailable(speed != 0);
         return;
     }
 

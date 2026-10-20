@@ -54,7 +54,9 @@ void motorInit(void);
 // ---------------------------------------------------------------------------
 // True only when the speed path is real: the PCA9685 address is confirmed, the
 // chip answered, and no bus error has been latched since its last successful
-// bring-up (boot, or motorDriveRecoveryService()).
+// bring-up (boot, or motorDriveRecoveryService()) -- AND the loop-stall guard
+// task is running and ticking (stall_guard.h; fail closed if it could not be
+// started or has stopped).
 //
 // Telemetry publishes this, and the Pi should refuse to drive without it.
 // ---------------------------------------------------------------------------
@@ -62,7 +64,17 @@ bool motorDriveAvailable(void);
 
 // Why motion is unavailable, for telemetry. Mirrors pca9685StatusName():
 //   "OK" / "ADDRESS_UNCONFIRMED" / "NOT_FOUND" / "INIT_FAILED" / "BUS_ERROR"
+// -- or "STALL_GUARD_NOT_RUNNING" if the guard task could not be started, has
+// not ticked yet, or has stopped ticking (stallGuardOperational()).
 const char *motorDriveStatusName(void);
+
+// ---------------------------------------------------------------------------
+// The drive is unavailable and a motion request is being refused: stop every
+// channel (stopMotors()). If the loop-stall guard is not operational and
+// output was live or `motionRequested` (any non-zero request), that is
+// recorded as a drive loss (motorConsumeLostWhileLive()).
+// ---------------------------------------------------------------------------
+void motorStopUnavailable(bool motionRequested);
 
 // ---------------------------------------------------------------------------
 // Try to get the speed path back while motorDriveAvailable() is false (see
@@ -76,7 +88,9 @@ bool motorDriveRecoveryService(void);
 // ---------------------------------------------------------------------------
 // Was motion lost to a failed PCA9685 enable write -- output LIVE at that
 // instant (any direction input driven), or the failing call asking for any
-// non-zero speed? A pure stop with nothing live is not recorded. Recorded by
+// non-zero speed? A pure stop with nothing live is not recorded. A loop-stall
+// guard trip, and the guard found not operational with output live or a
+// non-zero request refused, are recorded the same way. Recorded by
 // the motor layer the moment the write fails; returns it and clears it
 // (consume once). comm.cpp turns a true into the safety_stop latch and an
 // acknowledgement requirement. When any enable write fails, all eight

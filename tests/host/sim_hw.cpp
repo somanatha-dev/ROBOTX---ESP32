@@ -7,7 +7,13 @@
 //  SparkFun stub in stubs/; 0x42 answers only 1 byte per read here, so the
 //  simulated GPS sits in BACKOFF). Only these are simulated:
 //
-//    * Arduino core  -- millis()/delay() on the wall clock, GPIO as no-ops
+//    * Arduino core  -- millis()/delay() on the wall clock; GPIO no-ops, except
+//                       that the eight L298N direction pins keep their level
+//    * stall guard   -- its core-0 task is modelled by ticking it from millis()
+//                       at least every STALL_GUARD_PERIOD_MS of wall time, so
+//                       it stays operational (and still trips on a real stall
+//                       with a direction pin HIGH). No guard behaviour is
+//                       tested over the link; test_pca_recovery.cpp does that.
 //    * UART0         -- stdin (RX) and stdout (TX), raw bytes
 //    * HC-SR04 echo  -- pulseIn() returns the echo for SIM_FRONT_CM
 //    * I2C bus       -- ACKs at 0x40, 0x42 and 0x70; 0x70 echoes its last
@@ -50,6 +56,7 @@
 #include "Wire.h"
 #include "VL53L0X.h"
 #include "pca9685.h"
+#include "stall_guard.h"
 #include "config.h"
 
 void setup(void);
@@ -63,7 +70,18 @@ static double gFrontCm       = 150.0;
 // Arduino core
 // ---------------------------------------------------------------------------
 
-uint32_t millis(void)                         { return (uint32_t)(timeGetTime() - gStartMs); }
+// The guard task, modelled (see the header). It never reads the clock itself.
+static uint32_t gGuardTickMs = 0;
+
+uint32_t millis(void)
+{
+    uint32_t now = (uint32_t)(timeGetTime() - gStartMs);
+    if ((uint32_t)(now - gGuardTickMs) >= STALL_GUARD_PERIOD_MS) {
+        gGuardTickMs = now;
+        (void)stallGuardTick(now);
+    }
+    return now;
+}
 
 uint32_t micros(void)
 {
@@ -76,8 +94,30 @@ uint32_t micros(void)
 void     delay(uint32_t ms)                   { Sleep(ms); }
 void     delayMicroseconds(uint32_t us)       { (void)us; }
 void     pinMode(uint8_t pin, uint8_t mode)   { (void)pin; (void)mode; }
-void     digitalWrite(uint8_t pin, uint8_t v) { (void)pin; (void)v; }
-int      digitalRead(uint8_t pin)             { (void)pin; return HIGH; }
+
+// The direction pins keep their level, for the guard's "any output HIGH?".
+// Every other pin reads HIGH (an idle I2C bus to rover_i2c.cpp's recovery).
+static const uint8_t kDirPins[8] = {
+    M_FRONT_A_IN1, M_FRONT_A_IN2, M_FRONT_B_IN1, M_FRONT_B_IN2,
+    M_REAR_A_IN1,  M_REAR_A_IN2,  M_REAR_B_IN1,  M_REAR_B_IN2
+};
+static uint8_t gDirLevel[64];
+
+static bool isDirPin(uint8_t pin)
+{
+    for (int i = 0; i < 8; i++) if (kDirPins[i] == pin) return true;
+    return false;
+}
+
+void digitalWrite(uint8_t pin, uint8_t v)
+{
+    if (isDirPin(pin)) gDirLevel[pin & 63] = v ? HIGH : LOW;
+}
+
+int digitalRead(uint8_t pin)
+{
+    return isDirPin(pin) ? gDirLevel[pin & 63] : HIGH;
+}
 
 // SIM_FRONT_CM_FILE: a test rewrites this file to move the simulated obstacle
 // while the sketch runs. Re-read at most every 20 ms; unreadable -> unchanged.

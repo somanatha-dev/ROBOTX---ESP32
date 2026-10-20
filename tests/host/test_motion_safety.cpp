@@ -7,6 +7,8 @@
 //  on a MANUAL clock (every loop() pass's delay(1) advances it 1 ms), so every
 //  result is deterministic:
 //
+//    * stall guard -- its core-0 task ticks every STALL_GUARD_PERIOD_MS of
+//                     simulated time (advance())
 //    * GPIO        -- digitalWrite() on the eight L298N direction pins is
 //                     recorded, in order, in one event log with the PCA9685
 //    * PCA9685     -- pca9685.cpp replaced (as in sim_hw.cpp): SetDuty/AllOff
@@ -38,6 +40,7 @@
 #include "safety.h"
 #include "rear_tof.h"
 #include "protocol.h"
+#include "stall_guard.h"
 
 void setup(void);
 void loop(void);
@@ -86,9 +89,19 @@ static int enableIndexOfPin(int pin)       // motor channel 0..3 owning a pin
 static uint32_t gNow    = 0;
 static double   gFrontCm = 150.0;
 
+// The loop-stall guard task, modelled: it runs on its own core, so it ticks
+// every STALL_GUARD_PERIOD_MS of simulated time wherever the clock advances.
+static void advance(uint32_t ms)
+{
+    for (uint32_t i = 0; i < ms; i++) {
+        gNow++;
+        if ((gNow % STALL_GUARD_PERIOD_MS) == 0) (void)stallGuardTick(gNow);
+    }
+}
+
 uint32_t millis(void)                         { return gNow; }
 uint32_t micros(void)                         { return gNow * 1000UL; }
-void     delay(uint32_t ms)                   { gNow += ms; }
+void     delay(uint32_t ms)                   { advance(ms); }
 void     delayMicroseconds(uint32_t us)       { (void)us; }
 void     pinMode(uint8_t pin, uint8_t mode)   { (void)pin; (void)mode; }
 int      digitalRead(uint8_t pin)             { return gPin[pin & 63]; }
@@ -189,7 +202,7 @@ bool simVl53Init(void)
     int i = openRearIndex();
     if (i < 0) return false;
     gRear[i].initCalls++;
-    gNow += gRear[i].initDelayMs;
+    advance(gRear[i].initDelayMs);
     return gRear[i].initOk;
 }
 
@@ -698,6 +711,35 @@ static void testC_frontGateAndLatch(void)
     command("STOP");
 }
 
+// C6. Rear I2C backoff at the command level: the mux fails while reversing ->
+//     rear invalid -> reverse gated and the command discarded; forward is
+//     unaffected; after the mux recovers, nothing moves until a NEW command.
+static void testC_rearBackoffNoReplay(void)
+{
+    boot();
+    startDriving(-150, -150);                // reverse, rear valid and clear
+    gTcaPresent = false;                     // the mux stops answering
+    pass(REAR_TOF_STALE_MS + 400);
+    CHECK(rearTofI2cBackoffActive(), "mux failure did not back off the rear");
+    CHECK(safetyReverseBlocked(), "reverse open with the rear backing off");
+    CHECK(motorPinsAllLow() && enablesAllZero(), "still reversing with no rear sensing");
+    CHECK(commDesiredLeft() == 0 && commDesiredRight() == 0, "the reverse command was kept");
+
+    // Forward does not depend on the rear: still accepted during the backoff.
+    std::string a = command("DRIVE", ",\"left\":120,\"right\":120");
+    CHECK(has(a, "\"result\":\"ACCEPTED\""), a.c_str());   // forward refused during a rear backoff
+    command("STOP");
+
+    gTcaPresent = true;                      // the mux recovers
+    for (int i = 0; i < 40 && safetyReverseBlocked(); i++) pass(1000);
+    CHECK(!safetyReverseBlocked(), "rear sensing did not resume after the mux recovered");
+    CHECK(motorPinsAllLow() && enablesAllZero() && commAppliedLeft() == 0,
+          "a stale command replayed after the rear recovered");
+    a = command("DRIVE", ",\"left\":-120,\"right\":-120");
+    CHECK(has(a, "\"result\":\"ACCEPTED\""), a.c_str());   // new reverse refused after recovery
+    command("STOP");
+}
+
 // ===========================================================================
 // D. TOFTEST is refused while the rover is under motion control
 // ===========================================================================
@@ -788,6 +830,7 @@ int main(void)
         { "C3 reverse: rear invalid after boot",       testC_invalidAfterBoot },
         { "C4 reverse: valid rear, obstacle gates",    testC_validRear },
         { "C5 front gate + latch unchanged",           testC_frontGateAndLatch },
+        { "C6 rear backoff: no replay, forward kept",  testC_rearBackoffNoReplay },
         { "D1 TOFTEST refused under motion control",   testD_toftest },
         { "E1 build identity in READY and DIAG",       testE_identity },
     };

@@ -61,7 +61,14 @@ unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeoutUs)
 TwoWire Wire;
 
 static bool    gTcaNack = false;
+static bool    gTcaNackDeselect = false;   // only writes of mask 0 NACK
+static uint32_t gTcaDelayMs = 0;           // every TCA transaction takes this long
 static uint8_t gTcaMask = 0;
+
+// Every TCA control-byte write ATTEMPT (select or deselect), with its time.
+#define TCA_LOG_MAX 4096
+static uint32_t gTcaWriteTimes[TCA_LOG_MAX];
+static int      gTcaWrites = 0;
 static int     gTxAddr  = -1;
 static bool    gTxWrote = false;
 static uint8_t gTxByte  = 0;
@@ -90,8 +97,18 @@ size_t TwoWire::write(uint8_t b)
 uint8_t TwoWire::endTransmission(bool sendStop)
 {
     (void)sendStop;
+    if (gTxAddr == TCA9548A_I2C_ADDRESS) {
+        if (gTxWrote && gTcaWrites < TCA_LOG_MAX) {
+            gTcaWriteTimes[gTcaWrites] = gNow;
+        }
+        if (gTxWrote) gTcaWrites++;
+        gNow += gTcaDelayMs;                        // a slow (or hung) transaction
+    }
     if (gTxAddr != TCA9548A_I2C_ADDRESS || gTcaNack) {
         return 2;                                   // address NACK
+    }
+    if (gTxWrote && gTxByte == 0 && gTcaNackDeselect) {
+        return 2;                                   // deselect NACK only
     }
     if (gTxWrote) {
         gTcaMask = gTxByte;
@@ -147,6 +164,7 @@ struct SimTof {
     int      initCalls;
     uint32_t initTimes[SIM_MAX_INIT_LOG];
     uint32_t initDelayMs;   // clock advance per init(): models hung transactions
+    uint32_t readDelayMs;   // clock advance per register/range read (slow txn)
     bool     budgetOk;      // setMeasurementTimingBudget() result (false = the
                             // patched library refusing a zero VCSEL period)
     int      budgetCalls;
@@ -222,6 +240,7 @@ uint8_t simTofReadReg(uint8_t reg, uint8_t *status)
         return 0xFF;
     }
     const SimTof &t = gSim[i];
+    gNow += t.readDelayMs;
 
     if (reg == VL53L0X::RESULT_INTERRUPT_STATUS) {
         if (t.mode == M_ERR_READY) { *status = t.errCode; return 0xFF; }
@@ -282,6 +301,9 @@ static int         gFails  = 0;
 static void resetSim(void)
 {
     gTcaNack      = false;
+    gTcaNackDeselect = false;
+    gTcaDelayMs   = 0;
+    gTcaWrites    = 0;
     gTcaMask      = 0;
     gBadSelect    = 0;
     gFlagsSet     = 0;
@@ -294,6 +316,7 @@ static void resetSim(void)
         gSim[i].errCode   = 2;
         gSim[i].initCalls = 0;
         gSim[i].initDelayMs = 0;
+        gSim[i].readDelayMs = 0;
         gSim[i].budgetOk    = true;
         gSim[i].budgetCalls = 0;
     }
@@ -302,9 +325,9 @@ static void resetSim(void)
 }
 
 // The rear-relevant part of setup(), in setup()'s order.
-static void boot(void)
+static void boot(uint32_t startMs = 10)
 {
-    gNow = 10;
+    gNow = startMs;
     roverI2cInit();
     (void)tcaInit();
     safetyInit();
@@ -722,25 +745,38 @@ static void testK(void)
     gTcaNack = true;
     run(10000);
 
+    // Since the rear I2C backoff, a failing select is NOT retried every 20 ms
+    // poll any more: it is retried 1, 2, 4 s ... later. In 10 s from the first
+    // failure that is attempts at +0, +1, +3 and +7 s -- exactly 4 -- and each
+    // one enters a backoff. (Before the backoff: >= 100 per sensor.)
+    uint32_t total = 0;
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) total += rearTofBusErrTotal(i);
+    CHECK(total == 4, "select retried more often than the backoff allows");
+    CHECK(rearTofI2cBackoffEntries() == total, "a select failure did not enter a backoff");
+
     for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
-        CHECK(rearTofBusErrTotal(i) >= 100, "select failures not recorded");
-        CHECK(rearTofLastBusErrSite(i) == TOF_BUSERR_TCA_SELECT, "site");
-        CHECK(rearTofLastBusErrCode(i) == 2, "raw code not kept");
+        if (rearTofBusErrTotal(i) > 0) {
+            CHECK(rearTofLastBusErrSite(i) == TOF_BUSERR_TCA_SELECT, "site");
+            CHECK(rearTofLastBusErrCode(i) == 2, "raw code not kept");
+            CHECK(rearTofStatusOf(i) == TOF_BUS_ERROR, "status");
+            CHECK(rearTofFailStreak(i) == rearTofBusErrTotal(i), "failStreak behaviour changed");
+        }
+        CHECK(rearTofStatusOf(i) != TOF_VALID, "a sensor still reports VALID with the mux failing");
         CHECK(rearTofBusErrStreak(i) == 0, "select failure counted toward recovery");
         CHECK(rearTofInitialised(i), "select failure demoted a sensor");
         CHECK(rearTofReinitCount(i) == 0, "select failure triggered a re-init");
         CHECK(gSim[i].initCalls == calls[i], "sensor init() called");
-        CHECK(rearTofStatusOf(i) == TOF_BUS_ERROR, "status");
-        CHECK(rearTofFailStreak(i) >= 100, "failStreak behaviour changed");
         CHECK(rearTofHealthOf(i) == HEALTH_FAULT, "health behaviour changed");
     }
     CHECK(strcmp(tcaStatusName(), "BUS_ERROR") == 0, "TCA status");
     CHECK(rearTofBackendAvailable(), "backend dropped");
     CHECK(safetyReverseBlocked(), "reverse open with the mux failing");
 
+    // The next retry is at +15 s, so sensing resumes within one maximum
+    // backoff of the mux recovering -- not on the very next poll.
     gTcaNack = false;
-    run(1500);
-    CHECK(allValid(), "sensors did not resume after the mux recovered");
+    CHECK(runUntil([] { return allValid(); }, REAR_I2C_BACKOFF_MAX_MS + 2000),
+          "sensors did not resume after the mux recovered");
     for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
         CHECK(gSim[i].initCalls == calls[i], "mux recovery re-initialised a sensor");
     }
@@ -1186,6 +1222,191 @@ static void testW(void)
 
 enum Build { BOTH, REINIT_OFF, REINIT_ON };
 
+// ===========================================================================
+// REAR I2C BACKOFF (Phase 2)
+// ===========================================================================
+
+// Run until `n` more TCA writes have been attempted (or `maxMs` passes);
+// return the time of the last one, or 0 if they never happened.
+static uint32_t runUntilTcaWrites(int n, uint32_t maxMs)
+{
+    int target = gTcaWrites + n;
+    for (uint32_t i = 0; i < maxMs && gTcaWrites < target; i++) step();
+    return (gTcaWrites >= target && target - 1 < TCA_LOG_MAX) ? gTcaWriteTimes[target - 1] : 0;
+}
+
+// X. A persistently failing select backs off 1, 2, 4, 8, 16, 30, 30 s --
+//    one attempt per interval, no rear I2C in between.
+static void testX(void)
+{
+    bootAllValid();
+    gTcaNack = true;
+    uint32_t prev = runUntilTcaWrites(1, 1000);          // the first failing select
+    CHECK(prev != 0, "setup: no select attempted");
+    static const uint32_t kExpect[] = { 1000, 2000, 4000, 8000, 16000, 30000, 30000 };
+    const size_t n = sizeof(kExpect) / sizeof(kExpect[0]);
+    for (size_t k = 0; k < n; k++) {
+        int before = gTcaWrites;
+        uint32_t t = runUntilTcaWrites(1, kExpect[k] + 100);
+        CHECK(t != 0, "no retry after the backoff interval");
+        CHECK(gTcaWrites == before + 1, "more than one rear transaction per backoff interval");
+        uint32_t gap = t - prev;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "interval %u: %lu ms, expected %lu",
+                 (unsigned)k, (unsigned long)gap, (unsigned long)kExpect[k]);
+        CHECK(gap >= kExpect[k] && gap <= kExpect[k] + 2, msg);
+        uint32_t next = (k + 1 < n) ? kExpect[k + 1] : REAR_I2C_BACKOFF_MAX_MS;
+        CHECK(rearTofI2cBackoffIntervalMs() == next, "reported interval wrong");
+        prev = t;
+    }
+    CHECK(rearTofI2cBackoffActive() && rearTofI2cBackoffRemainingMs() > 0, "not reported as backing off");
+}
+
+// Y. A failing DESELECT backs off the same way (the select succeeds).
+static void testY(void)
+{
+    bootAllValid();
+    gTcaNackDeselect = true;
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 200), "a failed deselect did not back off");
+    CHECK(rearTofI2cBackoffEntries() == 1, "entries");
+    int w = gTcaWrites;
+    run(REAR_I2C_BACKOFF_INITIAL_MS - 50);
+    CHECK(gTcaWrites == w, "rear I2C during the backoff");
+    run(100);
+    CHECK(gTcaWrites == w + 2, "retry is not exactly one select + one deselect");
+    CHECK(rearTofI2cBackoffIntervalMs() == 2 * REAR_I2C_BACKOFF_INITIAL_MS, "did not double");
+}
+
+// Z. SLOW transactions back off even when they succeed: a VL53L0X read, and
+//    a TCA select. Below the threshold nothing happens.
+static void testZ(void)
+{
+    bootAllValid();
+    gSim[1].readDelayMs = REAR_I2C_SLOW_MS + 150;       // succeeds, but slowly
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 1000), "slow VL53L0X read did not back off");
+    int w = gTcaWrites;
+    run(REAR_I2C_BACKOFF_INITIAL_MS - 50);
+    CHECK(gTcaWrites == w, "rear I2C during the backoff (slow read)");
+    gSim[1].readDelayMs = 0;
+    CHECK(runUntil([] { return allValid(); }, REAR_I2C_BACKOFF_MAX_MS + 2000), "no recovery after the slow read cleared");
+
+    bootAllValid();
+    gTcaDelayMs = REAR_I2C_SLOW_MS + 150;               // every TCA txn slow, but OK
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 1000), "slow TCA select did not back off");
+    gTcaDelayMs = 0;
+    CHECK(runUntil([] { return allValid(); }, REAR_I2C_BACKOFF_MAX_MS + 2000), "no recovery after slow TCA cleared");
+
+    // Control: one sensor read is up to three VL53L0X transactions (ready
+    // register, range status, range). 20 ms each keeps the read step at
+    // ~40 ms, under REAR_I2C_SLOW_MS: normal operation, no backoff.
+    bootAllValid();
+    gSim[0].readDelayMs = 20;
+    run(3000);
+    CHECK(rearTofI2cBackoffEntries() == 0, "backed off below the slow threshold");
+}
+
+// AA. Validity expires during a backoff on the normal schedule for EVERY
+//     sensor (none is visited), and no stale distance is ever reported.
+static void testAA(void)
+{
+    bootAllValid();
+    gTcaNack = true;
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 200), "setup: no backoff");
+    uint32_t tFault = gNow;
+    uint32_t lastValidAge = 0;
+    for (uint32_t ms = 0; ms < 5000; ms++) {
+        step();
+        for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+            if (rearTofValid(i) && gNow - tFault > lastValidAge) lastValidAge = gNow - tFault;
+        }
+    }
+    CHECK(lastValidAge <= REAR_TOF_STALE_MS, "a sensor stayed valid past REAR_TOF_STALE_MS during the backoff");
+    for (int i = 0; i < REAR_TOF_SENSOR_COUNT; i++) {
+        CHECK(!rearTofValid(i), "sensor still valid");
+        CHECK(rearTofFilteredMm(i) <= 0, "a stale distance is still published");
+        CHECK(rearTofHealthOf(i) == HEALTH_FAULT, "health");
+    }
+}
+
+// AB. Reverse blocked throughout; the forward policy is unchanged.
+static void testAB(void)
+{
+    bootAllValid();
+    bool fwdBefore = safetyForwardBlocked();
+    CHECK(!safetyReverseBlocked(), "setup: reverse blocked with a healthy rear");
+    gTcaNack = true;
+    run(REAR_TOF_STALE_MS + 100);
+    CHECK(rearTofI2cBackoffActive(), "setup: no backoff");
+    CHECK(safetyReverseBlocked(), "reverse open while backing off");
+    CHECK(safetyRearSensorFault(), "rear not reported as a fault");
+    CHECK(safetyForwardBlocked() == fwdBefore, "rear backoff changed the forward gate");
+    run(20000);
+    CHECK(safetyReverseBlocked(), "reverse reopened during a long backoff");
+    CHECK(safetyForwardBlocked() == fwdBefore, "forward gate changed during a long backoff");
+}
+
+// AC. Recovery after the fault clears. A short healthy run keeps doubling; a
+//     long one (HEALTHY_RESET) starts again at INITIAL.
+static void testAC(void)
+{
+    bootAllValid();
+    gTcaNack = true;
+    CHECK(runUntil([] { return rearTofI2cBackoffIntervalMs() == 4000; }, 20000), "setup: backoff did not grow");
+    gTcaNack = false;
+    CHECK(runUntil([] { return allValid(); }, REAR_I2C_BACKOFF_MAX_MS + 2000), "no recovery");
+    CHECK(!safetyReverseBlocked(), "reverse still blocked after recovery");
+
+    run(2000);                                           // short healthy run
+    gTcaNack = true;
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 200), "no backoff");
+    CHECK(rearTofI2cBackoffIntervalMs() == 8000, "a short healthy run reset the backoff");
+
+    // Recovered = the backoff has ended AND fresh readings made every sensor
+    // valid again (right after a fault they are still valid from before it).
+    gTcaNack = false;
+    CHECK(runUntil([] { return !rearTofI2cBackoffActive() && allValid(); },
+                   REAR_I2C_BACKOFF_MAX_MS + 2000), "no recovery 2");
+    run(REAR_I2C_BACKOFF_HEALTHY_RESET_MS + 500);        // long healthy run
+    gTcaNack = true;
+    CHECK(runUntil([] { return rearTofI2cBackoffActive(); }, 200), "no backoff 2");
+    CHECK(rearTofI2cBackoffIntervalMs() == REAR_I2C_BACKOFF_INITIAL_MS,
+          "a long healthy run did not restart the backoff at INITIAL");
+}
+
+// AD. A VL53L0X that fails FAST keeps its per-sensor bound (demotion) and
+//     does NOT back off the whole rear: the other two stay in service.
+static void testAD(void)
+{
+    bootAllValid();
+    gSim[2].mode = M_ERR_READY;
+    // Checked at the moment of demotion (with runtime re-init built in, the
+    // demoted sensor is legitimately re-initialised a few seconds later).
+    CHECK(runUntil([] { return !rearTofInitialised(2); }, 6000),
+          "failing sensor not demoted by its own bound");
+    CHECK(rearTofI2cBackoffEntries() == 0, "a fast sensor failure backed off the whole rear");
+    CHECK(rearTofValid(0) && rearTofValid(1), "healthy sensors blinded");
+}
+
+// AE. Wrap-safe: the same schedule across a millis() rollover.
+static void testAE(void)
+{
+    resetSim();
+    boot(0xFFFFFFFFUL - 4000UL);                         // wraps ~4 s in
+    run(1500);
+    CHECK(allValid(), "setup: not valid near the wrap");
+    gTcaNack = true;
+    uint32_t prev = runUntilTcaWrites(1, 1000);
+    static const uint32_t kExpect[] = { 1000, 2000, 4000 };   // crosses the wrap
+    for (size_t k = 0; k < 3; k++) {
+        uint32_t t = runUntilTcaWrites(1, kExpect[k] + 100);
+        uint32_t gap = t - prev;
+        CHECK(gap >= kExpect[k] && gap <= kExpect[k] + 2, "wrong interval across the millis() wrap");
+        prev = t;
+    }
+    gTcaNack = false;
+    CHECK(runUntil([] { return allValid(); }, REAR_I2C_BACKOFF_MAX_MS + 2000), "no recovery across the wrap");
+}
+
 int main(int argc, char **argv)
 {
     static const struct { const char *name; TestFn fn; Build build; } kTests[] = {
@@ -1212,6 +1433,14 @@ int main(int argc, char **argv)
         { "U  RX-01: boot all-fail policy unchanged",     testU, REINIT_OFF },
         { "V  RX-01: demotion keeps latch, clears window", testV, REINIT_OFF },
         { "W  RX-01: hung boot init never retried",       testW, REINIT_OFF },
+        { "X  backoff: failing select 1,2,4,8,16,30,30 s", testX, BOTH },
+        { "Y  backoff: failing deselect",                 testY, BOTH },
+        { "Z  backoff: slow VL53/TCA txn; control",       testZ, BOTH },
+        { "AA backoff: validity expires, no stale data",  testAA, BOTH },
+        { "AB backoff: reverse blocked, forward same",    testAB, BOTH },
+        { "AC backoff: recovery + healthy-run reset",     testAC, BOTH },
+        { "AD fast VL53 failure: per-sensor, no backoff", testAD, BOTH },
+        { "AE backoff: millis() wraparound",              testAE, BOTH },
     };
     const Build thisBuild = REAR_TOF_RUNTIME_REINIT ? REINIT_ON : REINIT_OFF;
     const char *only = (argc > 1) ? argv[1] : NULL;

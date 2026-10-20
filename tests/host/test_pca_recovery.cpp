@@ -38,9 +38,12 @@
 #include "comm.h"
 #include "motor.h"
 #include "protocol.h"
+#include "stall_guard.h"
 
 void setup(void);
 void loop(void);
+
+extern bool gStallGuardHostCreateFails;     // stall_guard.cpp, host builds only
 
 static const uint8_t kMotorPins[8] = {
     M_FRONT_A_IN1, M_FRONT_A_IN2, M_FRONT_B_IN1, M_FRONT_B_IN2,
@@ -165,23 +168,86 @@ static void pcaWrite(uint8_t r, uint8_t v)
 // Arduino core (manual clock)
 // ---------------------------------------------------------------------------
 
+// The loop-stall guard task, modelled: it runs on its own core, so it ticks
+// every STALL_GUARD_PERIOD_MS of simulated time WHEREVER the clock advances --
+// in loop()'s delay(1), and inside every simulated slow or hung transaction.
+//
+// Block tracking: during an advance() of more than one period (a blocking
+// call), record when every direction pin was first LOW.
+static bool     gInBlock     = false;
+static uint32_t gBlockStartMs = 0;
+static uint32_t gBlockCutMs   = 0;      // 0 = not cut during the block
+static bool     gGuardTicks   = true;   // false: the guard task has stopped ticking
+static bool     gForceHighInBlock = false;  // drive a direction pin HIGH at a block's start
+static bool     gArmedInBlock     = false;  // stallGuardArmed() seen during the last block
+
+static bool pinsAllLowNow(void);
+
+static void advance(uint32_t ms)
+{
+    bool block = (ms > STALL_GUARD_PERIOD_MS);
+    if (block) {
+        gInBlock      = true;
+        gBlockStartMs = gNow;
+        gBlockCutMs   = 0;
+        gArmedInBlock = stallGuardArmed();
+        if (gForceHighInBlock) gPin[kMotorPins[0]] = HIGH;   // "output live"
+    }
+    for (uint32_t i = 0; i < ms; i++) {
+        gNow++;
+        if (gGuardTicks && !gStallGuardHostCreateFails && (gNow % STALL_GUARD_PERIOD_MS) == 0) {
+            (void)stallGuardTick(gNow);
+        }
+        if (block && gBlockCutMs == 0 && pinsAllLowNow()) {
+            gBlockCutMs = gNow;
+        }
+        scanEnergised();
+    }
+    if (block) gInBlock = false;
+}
+
 uint32_t millis(void)                         { return gNow; }
 uint32_t micros(void)                         { return gNow * 1000UL; }
-void     delay(uint32_t ms)                   { gNow += ms; }
+void     delay(uint32_t ms)                   { advance(ms); }
 void     delayMicroseconds(uint32_t us)       { (void)us; }
 void     pinMode(uint8_t pin, uint8_t mode)   { (void)pin; (void)mode; }
 int      digitalRead(uint8_t pin)             { return gPin[pin & 63]; }
 
+static int gHighWhileTripped = 0;       // a direction pin raised while tripped
+static int gDirHighWrites    = 0;       // every direction-pin HIGH write
+
+static bool isDirPin(uint8_t pin)
+{
+    for (int i = 0; i < 8; i++) if (kMotorPins[i] == pin) return true;
+    return false;
+}
+
 void digitalWrite(uint8_t pin, uint8_t v)
 {
+    if (v && isDirPin(pin) && stallGuardTripped()) gHighWhileTripped++;
+    if (v && isDirPin(pin)) gDirHighWrites++;
     gPin[pin & 63] = v ? HIGH : LOW;
     scanEnergised();
 }
 
+static bool pinsAllLowNow(void)
+{
+    for (int i = 0; i < 8; i++) if (gPin[kMotorPins[i]] != LOW) return false;
+    return true;
+}
+
+// HC-SR04: an echo at gFrontCm; pulseIn() busy-waits for it, as on the ESP32,
+// when gPulseBusy is set (the 20 ms worst case is what the guard must tolerate).
+static double gFrontCm   = 150.0;
+static bool   gPulseBusy = false;
+
 unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeoutUs)
 {
-    (void)pin; (void)state; (void)timeoutUs;
-    return (unsigned long)(150.0 / 0.01715);      // 150 cm: forward clear
+    (void)pin; (void)state;
+    unsigned long us = (unsigned long)(gFrontCm / 0.01715);
+    if (us > timeoutUs) us = timeoutUs;
+    if (gPulseBusy) advance((uint32_t)((us + 999) / 1000));
+    return (us >= timeoutUs) ? 0 : us;
 }
 
 SimSerial Serial;
@@ -283,10 +349,27 @@ static void deliverInjected(uint32_t arrivedAt)
 static void hangNow(void)
 {
     uint32_t start = gNow;
-    gNow += 1000;
+    advance(1000);
     P.hangs++;
     deliverInjected(start);
 }
+
+// Hangs on the OTHER I2C users (each: the next N transactions block 1000 ms,
+// then fail with code 5) -- the loop-stall guard must cover them all.
+static int gTcaHangNext  = 0;
+static int gBootTcaHang  = 0;           // consumed by boot(): hang during setup()
+static bool gBootForceHigh = false;     // consumed by boot(): force a pin HIGH in that hang
+static bool gBootGuardCreateFails = false;  // consumed by boot(): xTaskCreate... fails
+static bool gBootGuardNoTicks     = false;  // consumed by boot(): task created, never ticks
+static int gVl53HangNext = 0;
+static int gGpsHangNext  = 0;
+static int gGpsTxns      = 0;
+static uint32_t gGpsDelayMs = 0;        // every GPS transaction takes this long (legit burst)
+
+// A PCA data transaction that is SLOW but SUCCEEDS (the resume race).
+static int      gSlowOkAt   = 0;        // the n-th data txn after arming
+static int      gSlowOkTxns = 0;
+static uint32_t gSlowOkMs   = 0;
 
 uint8_t TwoWire::endTransmission(bool sendStop)
 {
@@ -294,10 +377,22 @@ uint8_t TwoWire::endTransmission(bool sendStop)
     cutTripwire();
 
     if (gTxAddr == TCA9548A_I2C_ADDRESS) {
+        if (gTcaHangNext > 0) { uint32_t st = gNow; gTcaHangNext--; advance(1000); deliverInjected(st); return 5; }
         if (!gTxBytes.empty()) gTcaMask = gTxBytes.back();
         return 0;
     }
+    if (gTxAddr == NEO9M_I2C_ADDRESS) {
+        gGpsTxns++;
+        if (gGpsHangNext > 0) { uint32_t st = gNow; gGpsHangNext--; advance(1000); deliverInjected(st); return 5; }
+        advance(gGpsDelayMs);
+        return 2;                            // GPS absent (NACK)
+    }
     if (gTxAddr != PCA9685_I2C_ADDRESS) return 2;
+
+    if (gSlowOkAt > 0 && !gTxBytes.empty() && ++gSlowOkTxns == gSlowOkAt) {
+        gSlowOkAt = 0;
+        advance(gSlowOkMs);                  // slow ... then it simply succeeds
+    }
 
     if (P.hang)     { hangNow(); return 5; }
     if (!P.present) return 2;
@@ -305,7 +400,7 @@ uint8_t TwoWire::endTransmission(bool sendStop)
         P.probes++;
         if (P.slowProbeMs > 0) {             // a slow but successful recovery probe
             uint32_t start = gNow;
-            gNow += P.slowProbeMs;
+            advance(P.slowProbeMs);
             P.slowProbeMs = 0;
             deliverInjected(start);
         }
@@ -364,6 +459,7 @@ bool     simVl53Init(void)                               { return rearOpen(); }
 uint8_t  simVl53ReadReg(uint8_t reg, uint8_t *status)
 {
     if (!rearOpen()) { *status = 2; return 0xFF; }
+    if (gVl53HangNext > 0) { uint32_t st = gNow; gVl53HangNext--; advance(1000); deliverInjected(st); *status = 5; return 0xFF; }
     *status = 0;
     if (reg == VL53L0X::RESULT_INTERRUPT_STATUS) return 0x07;
     if (reg == VL53L0X::RESULT_RANGE_STATUS)     return (uint8_t)(11 << 3);
@@ -507,11 +603,25 @@ static bool enableOutputsAllOff(void)
 }
 
 // Fresh firmware state, then setup() and enough passes for the sensor windows.
-static void boot(bool pcaPresent, int failDataTxns = 0, bool sleepStuck = false)
+static void boot(bool pcaPresent, int failDataTxns = 0, bool sleepStuck = false,
+                 uint32_t startMs = 0)
 {
     gRx.clear(); gRxPos = 0; gTx.clear();
     for (int i = 0; i < 64; i++) gPin[i] = LOW;
-    gNow = 0; gTcaMask = 0;
+    gNow = startMs; gTcaMask = 0;
+    gTcaHangNext = 0; gVl53HangNext = 0; gGpsHangNext = 0; gGpsTxns = 0; gGpsDelayMs = 0;
+    gSlowOkAt = 0; gSlowOkTxns = 0; gSlowOkMs = 0;
+    gFrontCm = 150.0; gPulseBusy = false;
+    gGuardTicks = !gBootGuardNoTicks;            // the guard task, as asked
+    gBootGuardNoTicks = false;
+    gStallGuardHostCreateFails = gBootGuardCreateFails;
+    gBootGuardCreateFails = false;
+    gHighWhileTripped = 0; gDirHighWrites = 0; gInBlock = false; gBlockCutMs = 0;
+    gForceHighInBlock = false; gArmedInBlock = false;
+    gTcaHangNext = gBootTcaHang;                 // a hang INSIDE setup(), if asked
+    gBootTcaHang = 0;
+    gForceHighInBlock = gBootForceHigh;
+    gBootForceHigh = false;
     pcaPowerOn();
     P.present = pcaPresent; P.failDataTxns = failDataTxns; P.hang = false;
     P.sleepStuck = sleepStuck; P.hangs = 0; P.probes = 0;
@@ -1613,6 +1723,552 @@ static void test26_openWindowVoidedByOutage(void)
     acknowledgeThenDrive("open window voided", base);
 }
 
+// ===========================================================================
+// LOOP-STALL GUARD (Phase 2)
+// ===========================================================================
+
+// Keep a DRIVE alive (refreshed every 500 ms, as the Pi does) for `ms`, or
+// until `stop()` is true.
+template <typename F>
+static void driveWhile(uint32_t ms, F stop, int l = 150, int r = 150)
+{
+    char f[64];
+    snprintf(f, sizeof(f), ",\"left\":%d,\"right\":%d", l, r);
+    uint32_t end = gNow + ms, next = gNow;
+    while ((int32_t)(gNow - end) < 0 && !stop()) {
+        if ((int32_t)(gNow - next) >= 0) { send("DRIVE", f); next = gNow + 500; }
+        pass(1);
+    }
+}
+
+static void driveFor(uint32_t ms) { driveWhile(ms, [] { return false; }); }
+
+enum BlockKind { BLK_PCA, BLK_TCA, BLK_VL53, BLK_GPS };
+
+static const char *blockName(BlockKind k)
+{
+    switch (k) {
+        case BLK_PCA:  return "PCA9685 write";
+        case BLK_TCA:  return "TCA9548A select";
+        case BLK_VL53: return "VL53L0X read";
+        default:       return "GPS transaction";
+    }
+}
+
+// Drive, then make the chosen I2C user hang 1 s while the wheels are driven.
+static void stallWhileDriving(BlockKind k)
+{
+    boot(true);
+    driveAccepted(150, 150);
+    switch (k) {
+        case BLK_PCA:  armFailure(3, true);  break;   // ch1 enable-off: hangs, fails
+        case BLK_TCA:  gTcaHangNext  = 1;    break;
+        case BLK_VL53: gVl53HangNext = 1;    break;
+        case BLK_GPS:  gGpsHangNext  = 1;    break;
+    }
+    // GPS is absent here and backs off (5 s doubling to GPS_BACKOFF_MAX_MS;
+    // gps.cpp state also carries over between this harness's simulated boots),
+    // so keep the drive alive until the hang has actually happened.
+    driveWhile(GPS_BACKOFF_MAX_MS + 10000, [k] {
+        return stallGuardTrips() > 0 ||
+               (k == BLK_PCA  && gFailSeen)          ||
+               (k == BLK_TCA  && gTcaHangNext  == 0) ||
+               (k == BLK_VL53 && gVl53HangNext == 0) ||
+               (k == BLK_GPS  && gGpsHangNext  == 0);
+    });
+}
+
+// 27. A 1 s hang in ANY I2C user while driving: the guard cuts all eight
+//     direction pins within T_STALL + one period of the hang starting.
+static void test27_guardCutsEveryBlockingPath(void)
+{
+    static const BlockKind kKinds[] = { BLK_PCA, BLK_TCA, BLK_VL53, BLK_GPS };
+    for (size_t i = 0; i < 4; i++) {
+        std::string w = std::string("hung ") + blockName(kKinds[i]) + " while driving";
+        stallWhileDriving(kKinds[i]);
+        CHECK(stallGuardTrips() == 1, "guard did not trip: " + w);
+        CHECK(gBlockCutMs != 0, "pins not cut during the hang: " + w);
+        uint32_t latency = gBlockCutMs - gBlockStartMs;
+        char msg[160];
+        snprintf(msg, sizeof(msg), "cut %lu ms after the hang began (limit %lu): %s",
+                 (unsigned long)latency,
+                 (unsigned long)(STALL_GUARD_T_STALL_MS + STALL_GUARD_PERIOD_MS), w.c_str());
+        CHECK(latency <= STALL_GUARD_T_STALL_MS + STALL_GUARD_PERIOD_MS, msg);
+        CHECK(directionPinsAllLow() && energisedWheels() == 0, "output after the trip: " + w);
+        CHECK(gHighWhileTripped == 0, "a direction pin raised while tripped: " + w);
+        pass(3);
+        CHECK(commSafetyStopLatched(), "trip not latched: " + w);
+        CHECK(stallGuardTripped(), "trip not sticky: " + w);
+    }
+}
+
+// 28. No false trip: a minute of driving with the ultrasonic busy-waiting
+//     ~17 ms per ping (290 cm echo) and GPS transactions taking 16 ms.
+static void test28_noFalseTrip(void)
+{
+    boot(true);
+    gFrontCm   = 290.0;
+    gPulseBusy = true;
+    gGpsDelayMs = 16;
+    pass(500);                                   // front windows refill at 290 cm
+    driveAccepted(150, 150);
+    gLongestPass = 0;
+    // At least 60 s, and until GPS has hit the bus (16 ms each) at least
+    // twice WHILE driving -- its backoff can be long in this harness.
+    const int      gps0 = gGpsTxns;
+    const uint32_t t0   = gNow;
+    driveWhile(GPS_BACKOFF_MAX_MS + 70000, [gps0, t0] {
+        return gNow - t0 >= 60000 && gGpsTxns - gps0 >= 2;
+    });
+    CHECK(stallGuardTrips() == 0, "the guard tripped on legitimate loop work");
+    CHECK(energisedWheels() == 4, "driving stopped");
+    CHECK(gGpsTxns - gps0 >= 2, "harness: GPS never hit the bus while driving");
+    char msg[96];
+    snprintf(msg, sizeof(msg), "longest pass %lu ms", (unsigned long)gLongestPass);
+    CHECK(gLongestPass < STALL_GUARD_T_STALL_MS, msg);
+    command("STOP");
+}
+
+// 29. Resume race: a PCA write is SLOW but SUCCEEDS (300 ms) at every write
+//     position; the guard trips meanwhile; when the write returns, nothing
+//     raises a direction pin again.
+static void test29_resumeRace(void)
+{
+    for (int n = 1; n <= 8; n++) {
+        char w[64];
+        snprintf(w, sizeof(w), "slow successful write %d", n);
+        boot(true);
+        driveAccepted(150, 150);
+        gSlowOkAt = n; gSlowOkTxns = 0; gSlowOkMs = 300;
+        pass(1);
+        CHECK(stallGuardTrips() == 1, std::string("guard did not trip: ") + w);
+        CHECK(gHighWhileTripped == 0, std::string("a direction pin raised after the trip: ") + w);
+        CHECK(directionPinsAllLow(), std::string("pins not LOW when the pass ended: ") + w);
+        long base = gEnergisedScans;
+        pass(200);
+        CHECK(gEnergisedScans == base && gHighWhileTripped == 0, std::string("output after the trip: ") + w);
+        CHECK(commSafetyStopLatched() && commDesiredLeft() == 0, std::string("not latched/discarded: ") + w);
+        CHECK(motorDriveAvailable(), std::string("the drive itself is fine (slow, not failed): ") + w);
+    }
+}
+
+// 30. The trip enters the Phase 1 acknowledgement flow: DRIVE, MOVE and
+//     MOTORTEST refused; an early RESET does not clear it; an eligible RESET
+//     after the settle window clears trip and latch; a fresh DRIVE drives.
+static void test30_tripAckContract(void)
+{
+    stallWhileDriving(BLK_TCA);
+    CHECK(stallGuardTripped(), "setup: no trip");
+    long base = gEnergisedScans;
+    pass(5);
+    std::string a = command("MOVE", ",\"dir\":\"F\",\"speed\":150");
+    CHECK(has(a, "\"result\":\"GATED\"") && has(a, "DRIVE_LOSS_UNACKNOWLEDGED"), "MOVE not refused: " + a);
+    CHECK(!resetAcks("RESET right after the trip"), "an early RESET acknowledged a guard trip");
+    CHECK(stallGuardTripped(), "an early RESET cleared the trip");
+    expectAckStillRequired("guard trip", base);
+    CHECK(stallGuardTripped(), "DRIVE/MOTORTEST cleared the trip");
+    std::string sys = freshSystem();
+    CHECK(has(sys, "\"stall_guard\":\"TRIPPED\"") && jsonInt(sys, "stall_guard_trips") == 1, sys);
+    acknowledgeThenDrive("guard trip", base);
+    CHECK(!stallGuardTripped(), "eligible RESET did not clear the trip");
+    sys = freshSystem();
+    CHECK(has(sys, "\"stall_guard\":\"ARMED\""), sys);
+}
+
+// 31. A PCA write that HANGS AND FAILS while driving: guard trip + drive loss
+//     + PCA recovery -- the recovered drive still does not move before the
+//     acknowledgement.
+static void test31_tripPlusRecovery(void)
+{
+    stallWhileDriving(BLK_PCA);
+    CHECK(stallGuardTripped() && !motorDriveAvailable(), "setup: trip + PCA loss expected");
+    long base = gEnergisedScans;
+    waitRecovered("trip + PCA failure");
+    CHECK(stallGuardTripped(), "PCA recovery cleared the guard trip");
+    expectAckStillRequired("trip + PCA recovery", base);
+    acknowledgeThenDrive("trip + PCA recovery", base);
+}
+
+// 32. Not armed during setup(): a 1 s hang inside setup() with a direction
+//     pin HIGH does not trip; the guard is armed when setup() ends.
+static void test32_notArmedInSetup(void)
+{
+    gBootTcaHang   = 1;                        // the TCA probe in setup() hangs 1 s ...
+    gBootForceHigh = true;                     // ... with a direction pin HIGH
+    boot(true);
+    CHECK(!gArmedInBlock, "the guard was armed during setup()");
+    CHECK(stallGuardTrips() == 0, "the guard tripped during setup()");
+    CHECK(stallGuardArmed(), "the guard is not armed after setup()");
+    // Control: the same forced block AFTER setup() does trip.
+    gForceHighInBlock = true;
+    advance(500);
+    CHECK(stallGuardTrips() == 1 && directionPinsAllLow(), "control: an armed guard did not trip");
+}
+
+// 33. While tripped every tick re-asserts LOW, whatever drove a pin HIGH.
+static void test33_reassertWhileTripped(void)
+{
+    stallWhileDriving(BLK_VL53);
+    CHECK(stallGuardTripped(), "setup: no trip");
+    for (int i = 0; i < 8; i++) {
+        gPin[kMotorPins[i]] = HIGH;            // a rogue write outside the contract
+        advance(STALL_GUARD_PERIOD_MS);
+        CHECK(directionPinsAllLow(), "a tick while tripped did not re-assert LOW");
+    }
+}
+
+// 34. Watchdog and telemetry after a trip: the 2 s watchdog still fires,
+//     TELEMETRY shows the latch, DIAG SYSTEM the trip.
+static void test34_watchdogTelemetryAfterTrip(void)
+{
+    boot(true);
+    int seq = send("DRIVE", ",\"left\":150,\"right\":150");
+    pass(1);
+    CHECK(has(ackFor(seq), "\"result\":\"ACCEPTED\""), ackFor(seq));
+    uint32_t lastCmd = gNow;
+    pass(200);
+    gTcaHangNext = 1;
+    while (stallGuardTrips() == 0 && gNow - lastCmd < 1500) pass(1);
+    CHECK(stallGuardTrips() == 1, "setup: no trip");
+    gTx.clear();
+    while (!commTimedOut() && gNow - lastCmd < 10000) pass(1);
+    CHECK(commTimedOut(), "watchdog did not fire after a trip");
+    CHECK(gNow - lastCmd <= COMMAND_TIMEOUT_MS + 5, "watchdog late after a trip");
+    CHECK(!lastLine("\"event\":\"COMMAND_TIMEOUT\"").empty(), "no COMMAND_TIMEOUT event");
+    std::string tel = freshTelemetry();
+    CHECK(has(tel, "\"safety_stop\":true") && has(tel, "\"left_applied\":0,\"right_applied\":0"), tel);
+    std::string sys = freshSystem();
+    CHECK(has(sys, "\"stall_guard\":\"TRIPPED\""), sys);
+}
+
+// 35. No output, no trip: a hang while STOPPED is not a guard event.
+static void test35_idleStallNoTrip(void)
+{
+    boot(true);
+    command("STOP");
+    pass(50);
+    gTcaHangNext = 1;
+    pass(100);
+    CHECK(gTcaHangNext == 0, "setup: hang did not happen");
+    CHECK(stallGuardTrips() == 0 && !stallGuardTripped(), "tripped with no output live");
+    CHECK(!commSafetyStopLatched(), "latched with no output live");
+}
+
+// 36. millis() wraparound: no false trip across the wrap, and a hang after it
+//     is still cut within the bound.
+static void test36_wraparound(void)
+{
+    boot(true, 0, false, 0xFFFFFFFFUL - 3000UL);
+    driveAccepted(150, 150);
+    driveFor(6000);                            // crosses 0xFFFFFFFF -> 0
+    CHECK(gNow < 0x80000000UL, "harness: clock did not wrap");
+    CHECK(stallGuardTrips() == 0, "false trip across the millis() wrap");
+    CHECK(energisedWheels() == 4, "driving stopped across the wrap");
+    gTcaHangNext = 1;
+    driveWhile(5000, [] { return gTcaHangNext == 0; });
+    CHECK(stallGuardTrips() == 1, "no trip after the wrap");
+    CHECK(gBlockCutMs - gBlockStartMs <= STALL_GUARD_T_STALL_MS + STALL_GUARD_PERIOD_MS,
+          "cut too late after the wrap");
+}
+
+// 37. A STOP that arrives DURING the stall is processed before the motor step
+//     of the next pass, so no direction write is ever attempted again -- the
+//     guard's own evidence must still latch the drive loss.
+static void test37_stopDuringStallStillLatches(void)
+{
+    static const BlockKind kKinds[] = { BLK_TCA, BLK_GPS };
+    for (size_t i = 0; i < 2; i++) {
+        std::string w = std::string("STOP delivered inside a hung ") + blockName(kKinds[i]);
+        boot(true);
+        driveAccepted(150, 150);
+        // The STOP's seq must be newer than every DRIVE the wait below sends
+        // (one per 500 ms for at most ~310 s), or it would be a stale replay.
+        int base = gSeq;
+        gSeq += 1000;
+        int seq;
+        gInjectFrame = frameFor("STOP", "", &seq);
+        gSeq = base;
+        gInjected = false;
+        if (kKinds[i] == BLK_TCA) gTcaHangNext = 1; else gGpsHangNext = 1;
+        driveWhile(GPS_BACKOFF_MAX_MS + 10000, [] { return gInjected; });
+        CHECK(gInjected && stallGuardTrips() == 1, "harness: no trip / no delivery, " + w);
+        gSeq = seq;                                // later frames continue after it
+        std::string a = awaitAck(seq, 3000);
+        CHECK(has(a, "\"result\":\"ACCEPTED\""), a);
+        pass(3);
+        CHECK(commSafetyStopLatched(), "a guard trip was not latched: " + w);
+        CHECK(stallGuardTripped(), "trip not sticky: " + w);
+        std::string d = command("DRIVE", ",\"left\":150,\"right\":150");
+        CHECK(has(d, "DRIVE_LOSS_UNACKNOWLEDGED"), "DRIVE not refused after the trip: " + d);
+    }
+}
+
+// ===========================================================================
+// LOOP-STALL GUARD LIVENESS (Phase 2, F1)
+// ===========================================================================
+
+static bool isNotRunning(void)
+{
+    return !stallGuardOperational() && !motorDriveAvailable() &&
+           strcmp(stallGuardStateName(), "NOT_RUNNING") == 0 &&
+           strcmp(motorDriveStatusName(), "STALL_GUARD_NOT_RUNNING") == 0;
+}
+
+// Every motion command refused as MOTOR_PWM_UNAVAILABLE; no direction pin raised.
+static void expectMotionRefusedNoGuard(const char *where)
+{
+    int  highs = gDirHighWrites;
+    long base  = gEnergisedScans;
+    std::string a = command("DRIVE", ",\"left\":150,\"right\":150");
+    CHECK(has(a, "\"result\":\"GATED\"") && has(a, "\"reason\":\"MOTOR_PWM_UNAVAILABLE\""),
+          std::string("DRIVE not refused, ") + where + " " + a);
+    a = command("MOVE", ",\"dir\":\"F\",\"speed\":150");
+    CHECK(has(a, "\"result\":\"GATED\"") && has(a, "\"reason\":\"MOTOR_PWM_UNAVAILABLE\""),
+          std::string("MOVE not refused, ") + where + " " + a);
+    a = command("MOTORTEST", ",\"motor\":0,\"power\":150,\"ms\":500,\"onblocks\":true");
+    CHECK(has(a, "\"result\":\"REJECTED\"") && has(a, "\"reason\":\"MOTOR_PWM_UNAVAILABLE\""),
+          std::string("MOTORTEST not refused, ") + where + " " + a);
+    pass(100);
+    CHECK(gDirHighWrites == highs && gEnergisedScans == base && directionPinsAllLow(),
+          std::string("a direction pin was raised, ") + where);
+    CHECK(commDesiredLeft() == 0 && commDesiredRight() == 0 && !commTestModeActive(),
+          std::string("a refused request was stored, ") + where);
+}
+
+// 38. xTaskCreatePinnedToCore() fails: never operational, never armed, the
+//     drive is unavailable from READY on, and nothing can raise a pin.
+static void test38_guardNotCreated(void)
+{
+    gBootGuardCreateFails = true;
+    boot(true);
+    CHECK(isNotRunning() && !stallGuardArmed(), "a guard that was never created is reported running");
+    std::string ready = lastLine("\"event\":\"READY\"");
+    CHECK(has(ready, "\"motor_drive_available\":false"), "READY: " + ready);
+    std::string sys = freshSystem();
+    CHECK(has(sys, "\"stall_guard\":\"NOT_RUNNING\"") &&
+          has(sys, "\"motor_drive_status\":\"STALL_GUARD_NOT_RUNNING\""), sys);
+    expectMotionRefusedNoGuard("guard never created");
+    CHECK(!stallGuardSetDirection(kMotorPins[0], HIGH, kMotorPins[1], LOW) && directionPinsAllLow(),
+          "stallGuardSetDirection raised a pin with no guard task");
+}
+
+// 39. Created, but no tick yet: NOT operational. stallGuardBegin()'s bounded
+//     wait for the first tick ends; READY says unavailable. The first REAL
+//     tick -- and nothing the loop does -- makes it operational.
+static void test39_createdNoTickYet(void)
+{
+    gBootGuardNoTicks = true;
+    boot(true);
+    CHECK(stallGuardArmed(), "harness: a created guard is armed at the end of setup()");
+    CHECK(isNotRunning(), "operational before the first tick");
+    std::string ready = lastLine("\"event\":\"READY\"");
+    CHECK(has(ready, "\"motor_drive_available\":false"), "READY before the first tick: " + ready);
+    passMs(2000);                                // loop() checks it hundreds of times
+    CHECK(isNotRunning(), "the loop's own checks made the guard look alive");
+    expectMotionRefusedNoGuard("no tick yet");
+    CHECK(commSafetyStopLatched(), "a non-zero request refused for a guard not running was not recorded");
+    (void)stallGuardTick(gNow);                  // the task's first tick
+    CHECK(stallGuardOperational() && motorDriveAvailable(), "the first tick did not make it operational");
+    advance(STALL_GUARD_LIVENESS_MS + 1);        // ... and no other
+    CHECK(isNotRunning(), "operational with no tick for longer than the liveness window");
+}
+
+// 40. Regular ticks: available on every pass of a drive; the window edge is
+//     exact (LIVENESS ms after the last tick: live; one more: not); a tick
+//     restores it; an idle gap records nothing.
+static void test40_regularTicksAndWindow(void)
+{
+    boot(true);
+    CHECK(has(lastLine("\"event\":\"READY\""), "\"motor_drive_available\":true"), "READY with the guard ticking");
+    driveAccepted(150, 150);
+    bool always = true;
+    driveWhile(3000, [&always] { if (!motorDriveAvailable()) always = false; return !always; });
+    CHECK(always, "drive unavailable on some pass while the guard ticks");
+    CHECK(energisedWheels() == 4 && !commSafetyStopLatched(), "driving was disturbed");
+    command("STOP");
+    pass(50);
+
+    while ((gNow % STALL_GUARD_PERIOD_MS) != 0) advance(1);   // a tick just ran
+    gGuardTicks = false;
+    advance(STALL_GUARD_LIVENESS_MS);
+    CHECK(stallGuardOperational() && motorDriveAvailable(), "stale at exactly the liveness window");
+    advance(1);
+    CHECK(isNotRunning(), "live one ms past the liveness window");
+    gGuardTicks = true;
+    advance(STALL_GUARD_PERIOD_MS);
+    CHECK(stallGuardOperational() && motorDriveAvailable(), "a new tick did not restore liveness");
+    pass(50);
+    CHECK(!commSafetyStopLatched(), "an idle liveness gap (nothing live, nothing asked) latched a loss");
+}
+
+// Drive (or MOTORTEST), then the guard task stops ticking. Returns the
+// energised-scan baseline once all direction pins are LOW again.
+static long livenessLossWhileDriving(bool motortest = false)
+{
+    boot(true);
+    if (motortest) {
+        std::string a = command("MOTORTEST", ",\"motor\":0,\"power\":150,\"ms\":3000,\"onblocks\":true");
+        CHECK(has(a, "\"result\":\"ACCEPTED\""), a);
+        pass(20);
+        CHECK(energisedWheels() == 1 && commTestModeActive(), "setup: MOTORTEST not running");
+    } else {
+        driveAccepted(150, 150);
+    }
+    gGuardTicks = false;
+    const uint32_t t0 = gNow;                    // the last tick was < 1 period ago
+    while (!directionPinsAllLow() && gNow - t0 < 2000) pass(1);
+    char msg[120];
+    snprintf(msg, sizeof(msg), "pins cut %lu ms after the ticks stopped (limit %lu)",
+             (unsigned long)(gNow - t0),
+             (unsigned long)(STALL_GUARD_LIVENESS_MS + STALL_GUARD_PERIOD_MS));
+    CHECK(directionPinsAllLow() && gNow - t0 <= STALL_GUARD_LIVENESS_MS + STALL_GUARD_PERIOD_MS, msg);
+    pass(3);
+    return gEnergisedScans;
+}
+
+// 41. Liveness lost during active motion (DRIVE and MOTORTEST): pins cut
+//     through stopMotors() (enables zeroed too), drive loss latched, MOTORTEST
+//     cancelled, reported as NOT_RUNNING. Not a stall trip.
+static void test41_lossDuringMotion(void)
+{
+    for (int mt = 0; mt <= 1; mt++) {
+        std::string w = mt ? "MOTORTEST" : "DRIVE";
+        livenessLossWhileDriving(mt != 0);
+        CHECK(isNotRunning(), "not reported NOT_RUNNING: " + w);
+        CHECK(energisedWheels() == 0 && enableOutputsAllOff(), "output left live: " + w);
+        CHECK(commSafetyStopLatched(), "liveness loss during motion not latched: " + w);
+        CHECK(!commTestModeActive() && commDesiredLeft() == 0 && commDesiredRight() == 0,
+              "motion request kept: " + w);
+        CHECK(stallGuardTrips() == 0 && !stallGuardTripped(), "counted as a stall trip: " + w);
+        std::string tel = freshTelemetry();
+        CHECK(has(tel, "\"safety_stop\":true") && has(tel, "\"motor_drive_available\":false"), tel);
+        std::string sys = freshSystem();
+        CHECK(has(sys, "\"stall_guard\":\"NOT_RUNNING\"") &&
+              has(sys, "\"motor_drive_status\":\"STALL_GUARD_NOT_RUNNING\""), sys);
+    }
+}
+
+// 42. Stale at rest: no latch (nothing live). Every motion command refused,
+//     no direction pin raised -- through the commands, the motor API and the
+//     guard API -- and the refused non-zero request IS recorded as a loss.
+//     Then the race: the guard stops while the first enable write of a DRIVE
+//     from rest is slow (300 ms) -- the direction write after it is refused.
+static void test42_refusedWhileStale(void)
+{
+    boot(true);
+    command("STOP");
+    pass(20);
+    gGuardTicks = false;
+    passMs(STALL_GUARD_LIVENESS_MS + STALL_GUARD_PERIOD_MS);
+    CHECK(isNotRunning(), "setup: guard not stale");
+    CHECK(!commSafetyStopLatched(), "a liveness loss at rest latched");
+    expectMotionRefusedNoGuard("guard stale");
+    CHECK(commSafetyStopLatched(), "a non-zero request refused for a stale guard was not recorded");
+    int highs = gDirHighWrites;
+    driveDifferential(150, 150);
+    motorDriveChannel(0, 150);
+    CHECK(!stallGuardSetDirection(kMotorPins[0], HIGH, kMotorPins[1], LOW), "guard API accepted a HIGH write");
+    CHECK(gDirHighWrites == highs && directionPinsAllLow(), "a direction pin was raised with the guard stale");
+
+    boot(true);
+    pass(20);
+    highs = gDirHighWrites;
+    gSlowOkAt = 1; gSlowOkTxns = 0; gSlowOkMs = 300;
+    gGuardTicks = false;                         // the guard stops as the DRIVE arrives
+    int seq = send("DRIVE", ",\"left\":150,\"right\":150");
+    pass(1);
+    CHECK(has(ackFor(seq), "\"result\":\"ACCEPTED\""), "race setup (guard live on arrival): " + ackFor(seq));
+    CHECK(gSlowOkAt == 0, "harness: the slow write did not happen");
+    CHECK(gDirHighWrites == highs && directionPinsAllLow() && energisedWheels() == 0,
+          "a direction pin was raised after the guard went stale mid-write");
+    pass(3);
+    CHECK(commSafetyStopLatched(), "the refused write was not recorded as a loss");
+}
+
+// 43. RESET while the guard is still stale: accepted, but no acknowledgement
+//     and no drive -- however long after the loss it comes.
+static void test43_resetWhileStale(void)
+{
+    long base = livenessLossWhileDriving();
+    passMs(ACK_SETTLE_MS + TELEMETRY_INTERVAL_MS + 50);
+    CHECK(!resetAcks("RESET with the guard stale"), "RESET acknowledged while the guard is stale");
+    CHECK(isNotRunning(), "RESET restored the drive with the guard stale");
+    std::string a = command("DRIVE", ",\"left\":150,\"right\":150");
+    CHECK(has(a, "\"result\":\"GATED\"") && has(a, "\"reason\":\"MOTOR_PWM_UNAVAILABLE\""), a);
+    std::string tel = freshTelemetry();
+    CHECK(has(tel, "\"safety_stop\":true") && has(tel, "\"motor_drive_available\":false"), tel);
+    CHECK(gEnergisedScans == base, "a wheel moved with the guard stale");
+}
+
+// 44. The guard ticks again: the drive is available but stays latched; an
+//     immediate RESET is not an acknowledgement; only the established
+//     settle-window RESET clears it; then a fresh DRIVE drives.
+static void test44_resumeStaysLatched(void)
+{
+    long base = livenessLossWhileDriving();
+    gGuardTicks = true;
+    pass(STALL_GUARD_PERIOD_MS + 1);
+    CHECK(motorDriveAvailable(), "drive not back once the guard ticks again");
+    CHECK(commSafetyStopLatched(), "the guard resuming cleared the latch");
+    CHECK(!resetAcks("RESET right after the guard resumed"), "acknowledged before the settle period");
+    expectAckStillRequired("guard liveness restored", base);
+    acknowledgeThenDrive("guard liveness restored", base);
+}
+
+// 45. No replay: requests made while stale, and refused after it resumed,
+//     are not stored; the acknowledging RESET moves nothing; only a fresh
+//     DRIVE moves the wheels.
+static void test45_noReplayAfterAck(void)
+{
+    long base = livenessLossWhileDriving();
+    command("DRIVE", ",\"left\":150,\"right\":150");
+    command("MOVE", ",\"dir\":\"F\",\"speed\":150");
+    gGuardTicks = true;
+    pass(20);
+    std::string a = command("DRIVE", ",\"left\":150,\"right\":150");
+    CHECK(has(a, "DRIVE_LOSS_UNACKNOWLEDGED"), "DRIVE not refused before acknowledgement: " + a);
+    passMs(ACK_SETTLE_MS + TELEMETRY_INTERVAL_MS + 50);
+    CHECK(resetAcks("eligible RESET after resume"), "eligible RESET did not acknowledge");
+    pass(500);
+    CHECK(gEnergisedScans == base && commDesiredLeft() == 0 && commDesiredRight() == 0,
+          "stale motion resumed after the acknowledgement");
+    driveAccepted(120, 120);
+    command("STOP");
+}
+
+// 46. millis() wraparound: no false staleness while ticking across the wrap;
+//     the window edge is exact across it; a dead guard stays dead when the
+//     clock wraps round to (or just before) its last stamp ~49.7 days on.
+static void test46_livenessWraparound(void)
+{
+    boot(true, 0, false, 0xFFFFFFFFUL - 3000UL);
+    driveAccepted(150, 150);
+    bool always = true;
+    driveWhile(6000, [&always] { if (!motorDriveAvailable()) always = false; return !always; });
+    CHECK(gNow < 0x80000000UL, "harness: clock did not wrap");
+    CHECK(always && energisedWheels() == 4 && !commSafetyStopLatched(), "false staleness across the wrap");
+    command("STOP");
+
+    boot(true, 0, false, 0xFFFFFFFFUL - 1000UL);
+    const uint32_t kT = 0xFFFFFFFFUL - 25UL;     // a tick: T + LIVENESS is past the wrap
+    CHECK((kT % STALL_GUARD_PERIOD_MS) == 0 && (uint32_t)(kT + STALL_GUARD_LIVENESS_MS) < 1000UL,
+          "harness: tick constant");
+    while (gNow != kT) advance(1);
+    gGuardTicks = false;
+    advance(STALL_GUARD_LIVENESS_MS);
+    CHECK(gNow < 1000UL && stallGuardOperational(), "false staleness at the edge, across the wrap");
+    advance(1);
+    CHECK(isNotRunning(), "false liveness past the edge, across the wrap");
+    gNow = kT + 5;                               // 2^32 + 5 ms after the last tick
+    CHECK(isNotRunning(), "a dead guard came back when millis() wrapped round to its stamp");
+    gNow = kT - 10;                              // 2^32 - 10 ms after it
+    CHECK(isNotRunning(), "a dead guard came back just before millis() reached its stamp");
+    gNow = 5000;
+    gGuardTicks = true;
+    advance(STALL_GUARD_PERIOD_MS);
+    CHECK(stallGuardOperational(), "a real tick did not restore liveness");
+}
+
 typedef void (*TestFn)(void);
 
 int main(void)
@@ -1644,6 +2300,26 @@ int main(void)
         { "24 RESET + DRIVE batch, both cases",           test24_resetThenDriveBatch },
         { "25 no stale state across outages",             test25_noStaleStateAcrossOutages },
         { "26 outage voids an OPEN ack window",           test26_openWindowVoidedByOutage },
+        { "27 guard: PCA/TCA/VL53/GPS hang cut in time",  test27_guardCutsEveryBlockingPath },
+        { "28 guard: no false trip (busy-wait, GPS)",     test28_noFalseTrip },
+        { "29 guard: resume race, every write position",  test29_resumeRace },
+        { "30 guard: trip -> ack contract",               test30_tripAckContract },
+        { "31 guard: trip + PCA recovery",                test31_tripPlusRecovery },
+        { "32 guard: not armed during setup()",           test32_notArmedInSetup },
+        { "33 guard: LOW re-asserted while tripped",      test33_reassertWhileTripped },
+        { "34 guard: watchdog + telemetry after trip",    test34_watchdogTelemetryAfterTrip },
+        { "35 guard: idle stall is not a trip",           test35_idleStallNoTrip },
+        { "36 guard: millis() wraparound",                test36_wraparound },
+        { "37 guard: STOP during the stall still latches", test37_stopDuringStallStillLatches },
+        { "38 liveness: task not created",              test38_guardNotCreated },
+        { "39 liveness: created, no tick yet",          test39_createdNoTickYet },
+        { "40 liveness: regular ticks, exact window",   test40_regularTicksAndWindow },
+        { "41 liveness: lost during DRIVE / MOTORTEST", test41_lossDuringMotion },
+        { "42 liveness: stale -> no HIGH write, race",  test42_refusedWhileStale },
+        { "43 liveness: RESET while stale",             test43_resetWhileStale },
+        { "44 liveness: resumed -> latched until ack",  test44_resumeStaysLatched },
+        { "45 liveness: no replay after the ack",       test45_noReplayAfterAck },
+        { "46 liveness: millis() wraparound",           test46_livenessWraparound },
     };
 
     printf("=== PCA9685 recovery (real pca9685.cpp) ===\n");
